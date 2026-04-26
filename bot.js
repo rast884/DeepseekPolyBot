@@ -41,11 +41,7 @@ function getMainKeyboard() {
 async function tgSend(msg) {
   if (!tg) return;
   try {
-    await tg.sendMessage(TG_CHAT_ID, msg, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...getMainKeyboard()
-    });
+    await tg.sendMessage(TG_CHAT_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true, ...getMainKeyboard() });
   } catch(e) {
     console.error('[TG] Send error:', e.message);
   }
@@ -54,10 +50,7 @@ async function tgSend(msg) {
 async function tgReply(chatId, msg) {
   if (!tg) return;
   try {
-    await tg.sendMessage(chatId, msg, {
-      parse_mode: 'HTML',
-      ...getMainKeyboard()
-    });
+    await tg.sendMessage(chatId, msg, { parse_mode: 'HTML', ...getMainKeyboard() });
   } catch(e) {
     console.error('[TG] Reply error:', e.message);
   }
@@ -73,10 +66,6 @@ function initFirebase() {
     const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
     if (!privateKey || !process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_CLIENT_EMAIL || !process.env.FIREBASE_DATABASE_URL) {
       console.error('[FB] Firebase env vars missing');
-      console.error('[FB] projectId:', process.env.FIREBASE_PROJECT_ID ? 'OK' : 'MISSING');
-      console.error('[FB] clientEmail:', process.env.FIREBASE_CLIENT_EMAIL ? 'OK' : 'MISSING');
-      console.error('[FB] privateKey:', privateKey ? 'OK (length ' + privateKey.length + ')' : 'MISSING');
-      console.error('[FB] databaseURL:', process.env.FIREBASE_DATABASE_URL ? 'OK' : 'MISSING');
       return false;
     }
 
@@ -115,6 +104,7 @@ let wsConnected = false;
 let roundPlaced = null;
 let _userBotOn = true;
 let botStarted = false;
+let lastTickLog = 0;
 
 function defaultState() {
   return {
@@ -172,22 +162,13 @@ async function saveState() {
 const roundId = (t) => Math.floor((t || Date.now()) / ROUND_MS) * ROUND_MS;
 const roundRemain = () => roundId() + ROUND_MS - Date.now();
 const fmtWindow = (rid) => {
-  const f = (d) => new Date(d).toLocaleTimeString('ru-RU', {
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZone: 'Europe/Moscow'
-  });
+  const f = (d) => new Date(d).toLocaleTimeString('ru-RU', { hour:'2-digit', minute:'2-digit', timeZone:'Europe/Moscow' });
   return `${f(rid)}–${f(rid + ROUND_MS)}`;
 };
 
 function getTimeToNextBet() {
   const rem = roundRemain();
-  let msToNext;
-  if (rem > 0) {
-    msToNext = rem;
-  } else {
-    msToNext = ROUND_MS + rem;
-  }
+  const msToNext = rem > 0 ? rem : ROUND_MS + rem;
   const mins = Math.floor(msToNext / 60000);
   const secs = Math.floor((msToNext % 60000) / 1000);
   return `${mins} мин ${secs} сек`;
@@ -200,94 +181,45 @@ function connectPriceWS() {
     ws.on('open', () => {
       wsConnected = true;
       console.log('[WS] Connected to Polymarket');
-      ws.send(JSON.stringify({
-        action: 'subscribe',
-        subscriptions: [{
-          topic: 'crypto_prices_chainlink',
-          type: '*',
-          filters: JSON.stringify({ symbol: 'btc/usd' })
-        }]
-      }));
+      ws.send(JSON.stringify({ action:'subscribe', subscriptions:[{ topic:'crypto_prices_chainlink', type:'*', filters:JSON.stringify({ symbol:'btc/usd' }) }] }));
     });
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.topic === 'crypto_prices_chainlink' && msg.payload?.symbol === 'btc/usd') {
           const p = parseFloat(msg.payload.value);
-          if (p > 0) {
-            currentPrice = p;
-            priceBuffer.push(p);
-            if (priceBuffer.length > 300) priceBuffer.shift();
-          }
+          if (p > 0) { currentPrice = p; priceBuffer.push(p); if (priceBuffer.length > 300) priceBuffer.shift(); }
         }
       } catch(e) {}
     });
-    ws.on('close', () => {
-      wsConnected = false;
-      console.log('[WS] Disconnected, reconnecting in 5s...');
-      setTimeout(connectPriceWS, 5000);
-    });
-    ws.on('error', (err) => {
-      wsConnected = false;
-      console.error('[WS] Error:', err.message);
-    });
-  } catch(e) {
-    console.error('[WS] Connection error:', e.message);
-    setTimeout(connectPriceWS, 10000);
-  }
+    ws.on('close', () => { wsConnected = false; console.log('[WS] Disconnected, reconnecting in 5s...'); setTimeout(connectPriceWS, 5000); });
+    ws.on('error', (err) => { wsConnected = false; console.error('[WS] Error:', err.message); });
+  } catch(e) { console.error('[WS] Connection error:', e.message); setTimeout(connectPriceWS, 10000); }
 }
 
 async function fetchPriceFallback() {
   try {
-    const r = await fetch('https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT', { timeout: 5000 });
+    const r = await fetch('https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT', { timeout:5000 });
     const d = await r.json();
     const t = d.result?.list?.[0];
-    if (t) {
-      currentPrice = parseFloat(t.lastPrice);
-      priceBuffer.push(currentPrice);
-      if (priceBuffer.length > 300) priceBuffer.shift();
-    }
+    if (t) { currentPrice = parseFloat(t.lastPrice); priceBuffer.push(currentPrice); if (priceBuffer.length > 300) priceBuffer.shift(); }
   } catch(e) {
     try {
-      const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', { timeout: 5000 });
+      const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', { timeout:5000 });
       const d = await r.json();
-      if (d.bitcoin?.usd) {
-        currentPrice = d.bitcoin.usd;
-        priceBuffer.push(currentPrice);
-      }
+      if (d.bitcoin?.usd) { currentPrice = d.bitcoin.usd; priceBuffer.push(currentPrice); }
     } catch(e2) {}
   }
 }
 
-// ── KLINE BUILDER ─────────────────────────────────────────────────────
-function buildKlines() {
-  if (priceBuffer.length < 10) return [];
-  const buf = priceBuffer.slice(-90);
-  const chunkSize = Math.max(1, Math.floor(buf.length / 15));
-  const candles = [];
-  for (let i = 0; i < 15; i++) {
-    const chunk = buf.slice(i * chunkSize, (i + 1) * chunkSize);
-    if (!chunk.length) continue;
-    candles.push({
-      o: chunk[0],
-      h: Math.max(...chunk),
-      l: Math.min(...chunk),
-      c: chunk[chunk.length - 1],
-      v: chunk.length,
-    });
-  }
-  return candles;
-}
-
 // ── POLYMARKET SENTIMENT ──────────────────────────────────────────────
 let pmUpProb = 0.5, pmDownProb = 0.5, pmLastFetch = 0;
-
 async function fetchPolymarketSentiment() {
-  if (Date.now() - pmLastFetch < 60000) return;
+  if (Date.now() - pmLastFetch < 30000) return;
   try {
-    const nowSec = Math.floor(Date.now() / 1000);
+    const nowSec = Math.floor(Date.now()/1000);
     const slug = `btc-updown-15m-${nowSec - (nowSec % 900)}`;
-    const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`, { timeout: 4000 });
+    const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`, { timeout:4000 });
     if (!r.ok) return;
     const data = await r.json();
     const market = data?.[0]?.markets?.[0];
@@ -299,57 +231,46 @@ async function fetchPolymarketSentiment() {
   } catch(e) {}
 }
 
-// ── AI SIGNAL ─────────────────────────────────────────────────────────
-function aiSignal(klines) {
-  if (klines.length < 5)
-    return { direction: 'UP', confidence: 52, skip: true, reason: 'Нет данных', score: 0 };
+// ── AI SIGNAL (ВСЕГДА ВЫБИРАЕТ НАПРАВЛЕНИЕ) ──────────────────────────
+function aiSignal() {
+  // Если недостаточно данных — ставим UP по умолчанию
+  if (priceBuffer.length < 2) {
+    return { direction: 'UP', confidence: 55, reason: 'UP (по умолчанию)', score: 0.5 };
+  }
 
-  const n = klines.length, c = klines.map(k => k.c), o = klines.map(k => k.o),
-    v = klines.map(k => k.v);
   let score = 0;
   const signals = [];
 
-  const rA = (c[n - 1] + c[n - 2] + c[n - 3]) / 3, eA = (c[0] + c[1] + c[2]) / 3;
-  if (rA > eA * 1.001) { score += 2.5; signals.push('Тренд▲'); }
-  else if (rA < eA * 0.999) { score -= 2.5; signals.push('Тренд▼'); }
-  else signals.push('Флет');
-
-  let bullC = 0, bearC = 0;
-  for (let i = n - 4; i < n; i++) { if (c[i] > o[i]) bullC++; else bearC++; }
-  if (bullC >= 3) { score += 2.5; signals.push(`${bullC}×Bull`); }
-  if (bearC >= 3) { score -= 2.5; signals.push(`${bearC}×Bear`); }
-
-  const avgV = v.slice(0, -1).reduce((a, b) => a + b, 0) / (n - 1);
-  if (v[n - 1] > avgV * 1.5) { score += (c[n - 1] > o[n - 1] ? 1.5 : -1.5); signals.push('VolSpike'); }
-
-  const gains = [], losses = [];
-  for (let i = 1; i < n; i++) { const d = c[i] - c[i - 1]; if (d > 0) gains.push(d); else losses.push(Math.abs(d)); }
-  const aG = gains.length ? gains.reduce((a, b) => a + b, 0) / gains.length : 0;
-  const aL = losses.length ? losses.reduce((a, b) => a + b, 0) / losses.length : 0.001;
-  const rsi = 100 - 100 / (1 + aG / aL);
-  if (rsi > 75) { score -= 2; signals.push(`RSI${rsi.toFixed(0)}OB`); }
-  else if (rsi < 25) { score += 2; signals.push(`RSI${rsi.toFixed(0)}OS`); }
-
-  if (pmUpProb >= 0.65) { score += 4; signals.push(`PM▲${(pmUpProb * 100).toFixed(0)}%`); }
-  else if (pmUpProb <= 0.35) { score -= 4; signals.push(`PM▼${(pmDownProb * 100).toFixed(0)}%`); }
-  else if (pmUpProb >= 0.57) { score += 2; signals.push(`PM▲${(pmUpProb * 100).toFixed(0)}%`); }
-  else if (pmUpProb <= 0.43) { score -= 2; signals.push(`PM▼${(pmDownProb * 100).toFixed(0)}%`); }
-
-  if (priceBuffer.length >= 60) {
-    const recent = priceBuffer.slice(-60);
-    const range = Math.max(...recent) - Math.min(...recent);
-    if (range < 30) { score *= 0.3; signals.push(`Флет⚠$${range.toFixed(0)}`); }
+  // 1. Ценовой тренд по буферу
+  if (priceBuffer.length >= 10) {
+    const recent = priceBuffer.slice(-5);
+    const older = priceBuffer.slice(-10, -5);
+    const recentAvg = recent.reduce((a,b) => a+b, 0) / recent.length;
+    const olderAvg = older.reduce((a,b) => a+b, 0) / older.length;
+    if (recentAvg > olderAvg) { score += 1; signals.push('Цена▲'); }
+    else { score -= 1; signals.push('Цена▼'); }
   }
 
-  const absScore = Math.abs(score);
-  const skip = absScore < 3.5;
+  // 2. Последнее движение
+  if (priceBuffer.length >= 3) {
+    const last = priceBuffer[priceBuffer.length - 1];
+    const prev = priceBuffer[priceBuffer.length - 3];
+    if (last > prev) { score += 1; signals.push('Движ▲'); }
+    else { score -= 1; signals.push('Движ▼'); }
+  }
+
+  // 3. Polymarket
+  if (pmUpProb > 0.55) { score += 2; signals.push(`PM▲${(pmUpProb*100).toFixed(0)}%`); }
+  else if (pmUpProb < 0.45) { score -= 2; signals.push(`PM▼${(pmDownProb*100).toFixed(0)}%`); }
+  else if (pmUpProb > 0.50) { score += 1; signals.push(`PM▲${(pmUpProb*100).toFixed(0)}%`); }
+  else if (pmUpProb < 0.50) { score -= 1; signals.push(`PM▼${(pmDownProb*100).toFixed(0)}%`); }
+
   const dir = score >= 0 ? 'UP' : 'DOWN';
-  const conf = Math.min(87, Math.max(52, 52 + absScore * 4));
+  const conf = Math.min(70, Math.max(53, 55 + Math.abs(score) * 3));
   return {
     direction: dir,
     confidence: conf,
-    skip,
-    reason: `${dir} ${conf.toFixed(0)}% | Скор:${score.toFixed(1)} | ${signals.join(',')}`,
+    reason: `${dir} ${conf.toFixed(0)}% | ${signals.join(', ')}`,
     score
   };
 }
@@ -361,38 +282,28 @@ async function placeBet(rid) {
   if (!shouldBotRun()) return;
   if (state.wallet.balance < FIXED_BET) {
     await tgSend('❌ Баланс < $5. Остановка.');
-    _userBotOn = false;
-    await saveState();
-    return;
+    _userBotOn = false; await saveState(); return;
   }
+
+  console.log(`[BOT] 🎯 Placing bet for round ${fmtWindow(rid)}...`);
   roundPlaced = rid;
+
   if (!wsConnected) await fetchPriceFallback();
   await fetchPolymarketSentiment();
-  const klines = buildKlines();
-  const sig = aiSignal(klines);
-  if (sig.skip) {
-    state.history.unshift({
-      id: rid, direction: sig.direction, confidence: sig.confidence,
-      reason: sig.reason, betAmount: 0, startPrice: currentPrice,
-      endPrice: null, window: fmtWindow(rid), result: 'skip', pnl: 0,
-      balanceAfter: state.wallet.balance, ts: new Date().toISOString()
-    });
-    if (state.history.length > 200) state.history = state.history.slice(0, 200);
-    state.lastRoundId = rid;
-    await saveState();
-    console.log(`[BOT] Skip round ${fmtWindow(rid)} | score: ${sig.score.toFixed(1)}`);
-    return;
-  }
+
+  const sig = aiSignal();
+
   state.wallet.balance = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
   state.wallet.totalBet += FIXED_BET;
   state.lastRoundId = rid;
   state.pendingBet = {
-    id: rid, direction: sig.direction, confidence: sig.confidence,
-    reason: sig.reason, betAmount: FIXED_BET, startPrice: currentPrice,
-    endPrice: null, window: fmtWindow(rid), result: 'pending', pnl: 0,
-    ts: new Date().toISOString()
+    id:rid, direction:sig.direction, confidence:sig.confidence,
+    reason:sig.reason, betAmount:FIXED_BET, startPrice:currentPrice,
+    endPrice:null, window:fmtWindow(rid), result:'pending', pnl:0,
+    ts:new Date().toISOString()
   };
   await saveState();
+
   const dirEmoji = sig.direction === 'UP' ? '🟢' : '🔴';
   const msg = [
     `${dirEmoji} <b>${sig.direction}</b> $${FIXED_BET} @ $${Math.round(currentPrice)}`,
@@ -401,58 +312,46 @@ async function placeBet(rid) {
     `💰 Баланс: $${state.wallet.balance.toFixed(2)}`,
     `📈 ${sig.reason}`,
   ].join('\n');
-  console.log(`[BOT] BET: ${sig.direction} $${FIXED_BET} | ${fmtWindow(rid)}`);
+  console.log(`[BOT] ✅ BET PLACED: ${sig.direction} $${FIXED_BET} | ${fmtWindow(rid)}`);
   await tgSend(msg);
 }
 
 async function resolveBet() {
   const bet = state.pendingBet;
   if (!bet || bet.result !== 'pending') return;
+
+  console.log(`[BOT] 🔄 Resolving bet from round ${fmtWindow(bet.id)}...`);
+
   if (!wsConnected) await fetchPriceFallback();
   bet.endPrice = currentPrice;
   const up = bet.endPrice >= bet.startPrice;
   const won = (bet.direction === 'UP' && up) || (bet.direction === 'DOWN' && !up);
+
   if (won) {
     const p = parseFloat((FIXED_BET * WIN_MULT).toFixed(2));
     state.wallet.balance = parseFloat((state.wallet.balance + FIXED_BET + p).toFixed(2));
     state.wallet.pnl = parseFloat((state.wallet.pnl + p).toFixed(2));
-    state.wallet.wins++;
-    state.stats.curStreak++;
-    state.stats.totalWin += p;
+    state.wallet.wins++; state.stats.curStreak++; state.stats.totalWin += p;
     if (state.stats.curStreak > state.stats.bestStreak) state.stats.bestStreak = state.stats.curStreak;
-    bet.result = 'win';
-    bet.pnl = p;
-    const msg = [
-      `✅ <b>WIN</b> +$${p.toFixed(2)}`,
-      `💰 Баланс: $${state.wallet.balance.toFixed(2)}`,
-      `🔥 Серия: ${state.stats.curStreak}`,
-      `📊 W${state.wallet.wins}/L${state.wallet.losses}`,
-    ].join('\n');
-    console.log(`[BOT] WIN +$${p.toFixed(2)} | Balance: $${state.wallet.balance.toFixed(2)}`);
-    await tgSend(msg);
+    bet.result = 'win'; bet.pnl = p;
+    console.log(`[BOT] ✅ WIN +$${p.toFixed(2)} | Balance: $${state.wallet.balance.toFixed(2)}`);
+    await tgSend(`✅ <b>WIN</b> +$${p.toFixed(2)}\n💰 Баланс: $${state.wallet.balance.toFixed(2)}\n🔥 Серия: ${state.stats.curStreak}\n📊 W${state.wallet.wins}/L${state.wallet.losses}`);
   } else {
     state.wallet.pnl = parseFloat((state.wallet.pnl - FIXED_BET).toFixed(2));
-    state.wallet.losses++;
-    state.stats.curStreak = 0;
-    state.stats.totalLoss += FIXED_BET;
-    bet.result = 'loss';
-    bet.pnl = -FIXED_BET;
-    const msg = [
-      `❌ <b>LOSS</b> -$${FIXED_BET}`,
-      `💰 Баланс: $${state.wallet.balance.toFixed(2)}`,
-      `📊 W${state.wallet.wins}/L${state.wallet.losses}`,
-    ].join('\n');
-    console.log(`[BOT] LOSS -$${FIXED_BET} | Balance: $${state.wallet.balance.toFixed(2)}`);
-    await tgSend(msg);
+    state.wallet.losses++; state.stats.curStreak = 0; state.stats.totalLoss += FIXED_BET;
+    bet.result = 'loss'; bet.pnl = -FIXED_BET;
+    console.log(`[BOT] ❌ LOSS -$${FIXED_BET} | Balance: $${state.wallet.balance.toFixed(2)}`);
+    await tgSend(`❌ <b>LOSS</b> -$${FIXED_BET}\n💰 Баланс: $${state.wallet.balance.toFixed(2)}\n📊 W${state.wallet.wins}/L${state.wallet.losses}`);
   }
+
   bet.balanceAfter = state.wallet.balance;
   state.history.unshift({ ...bet });
-  if (state.history.length > 200) state.history = state.history.slice(0, 200);
+  if (state.history.length > 200) state.history = state.history.slice(0,200);
   state.pendingBet = null;
   await saveState();
+
   if (state.wallet.balance < FIXED_BET) {
-    _userBotOn = false;
-    await saveState();
+    _userBotOn = false; await saveState();
     await tgSend('⚠️ Баланс < $5. Бот остановлен.');
   }
 }
@@ -460,23 +359,28 @@ async function resolveBet() {
 // ── MAIN TICK ─────────────────────────────────────────────────────────
 async function tick() {
   if (!state || !botStarted) return;
+
   const rid = roundId();
   const rem = roundRemain();
-  // Resolve
-  if (rem < 10000 && state.pendingBet?.result === 'pending' && state.pendingBet?.id === rid) {
+
+  if (Date.now() - lastTickLog > 30000) {
+    console.log(`[TICK] ${fmtWindow(rid)} | Rem: ${Math.floor(rem/1000)}s | Price: $${Math.round(currentPrice)} | ShouldRun: ${shouldBotRun()} | Placed: ${roundPlaced===rid}`);
+    lastTickLog = Date.now();
+  }
+
+  // Resolve за 10 секунд до конца
+  if (rem < 10000 && rem > 0 && state.pendingBet?.result === 'pending') {
     await resolveBet();
   }
-  // Place
-  if (rem > ROUND_MS - 25000 && shouldBotRun()) {
+
+  // Place в первые 20 секунд раунда
+  if (rem > ROUND_MS - 20000 && shouldBotRun()) {
     await placeBet(rid);
   }
-  // Fallback price
+
+  // Fallback цена
   if (!wsConnected && Date.now() % 30000 < 5000) {
     await fetchPriceFallback();
-  }
-  // Resolve if outside working hours
-  if (!isWorkingHours() && state.pendingBet?.result === 'pending') {
-    await resolveBet();
   }
 }
 
@@ -487,18 +391,14 @@ function listenForCommands() {
     const val = snap.val();
     if (typeof val === 'boolean' && val !== _userBotOn) {
       _userBotOn = val;
-      console.log(`[STATE] botOn changed to: ${_userBotOn}`);
+      console.log(`[STATE] botOn: ${_userBotOn}`);
       await tgSend(_userBotOn ? '▶ Бот запущен' : '■ Бот остановлен');
-      if (!_userBotOn && state.pendingBet?.result === 'pending') await resolveBet();
     }
   });
   db.ref('btc15m/command').on('value', async snap => {
     if (snap.val() === 'reset') {
-      state = defaultState();
-      roundPlaced = null;
-      await saveState();
+      state = defaultState(); roundPlaced = null; await saveState();
       await db.ref('btc15m/command').remove();
-      console.log('[STATE] Reset command received');
       await tgSend('↺ Сброс. Баланс: $100');
     }
   });
@@ -509,170 +409,72 @@ function setupTelegramListeners() {
   if (!tg) return;
 
   tg.onText(/\/start/, async (msg) => {
-    await tgReply(msg.chat.id, '🤖 <b>BTC 15M Бот</b>\nВыберите действие:');
+    await tgReply(msg.chat.id, '🤖 <b>BTC 15M Бот</b>\nСтавка КАЖДЫЕ 15 минут');
   });
 
   tg.onText(/\/balance|💰 Баланс/, async (msg) => {
-    if (!state) {
-      await tgReply(msg.chat.id, '⏳ Бот ещё не загрузился...');
-      return;
-    }
-    const w = state.wallet;
-    const s = state.stats;
-    const text = [
-      '<b>Баланс</b>',
-      `💰 Баланс: $${w.balance.toFixed(2)}`,
-      `📈 PnL: $${w.pnl.toFixed(2)}`,
-      `✅ Побед: ${w.wins}`,
-      `❌ Поражений: ${w.losses}`,
-      `🔥 Серия: ${s.curStreak}`,
-      `🏆 Рекорд: ${s.bestStreak}`,
-      `💵 Ставок: ${w.wins + w.losses}`,
-    ].join('\n');
-    await tgReply(msg.chat.id, text);
+    if (!state) { await tgReply(msg.chat.id, '⏳ Загрузка...'); return; }
+    const w = state.wallet; const s = state.stats;
+    await tgReply(msg.chat.id, `<b>Баланс</b>\n💰 $${w.balance.toFixed(2)}\n📈 PnL: $${w.pnl.toFixed(2)}\n✅ W:${w.wins} ❌ L:${w.losses}\n🔥 Серия: ${s.curStreak}`);
   });
 
   tg.onText(/\/status|📊 Статус/, async (msg) => {
-    if (!state) {
-      await tgReply(msg.chat.id, '⏳ Бот ещё не загрузился...');
-      return;
-    }
-    const text = [
-      '<b>Статус</b>',
-      `🤖 Бот: ${_userBotOn ? '🟢 Вкл' : '🔴 Выкл'}`,
-      `⏰ Расписание: ${isWorkingHours() ? '🟢 Работает' : '🔴 Ночь'}`,
-      `📈 Цена BTC: $${Math.round(currentPrice)}`,
-      `⏳ До ставки: ${getTimeToNextBet()}`,
-      `💰 Баланс: $${state.wallet.balance.toFixed(2)}`,
-    ].join('\n');
-    await tgReply(msg.chat.id, text);
+    if (!state) { await tgReply(msg.chat.id, '⏳ Загрузка...'); return; }
+    await tgReply(msg.chat.id, `<b>Статус</b>\n🤖 ${_userBotOn?'🟢':'🔴'} | ⏰ ${isWorkingHours()?'🟢':'🔴'}\n📈 $${Math.round(currentPrice)}\n⏳ Ставка через: ${getTimeToNextBet()}\n💰 $${state.wallet.balance.toFixed(2)}`);
   });
 
   tg.onText(/\/price|📈 Цена BTC/, async (msg) => {
-    await tgReply(msg.chat.id, `📈 <b>BTC</b>: $${Math.round(currentPrice)}`);
+    await tgReply(msg.chat.id, `📈 BTC: $${Math.round(currentPrice)}`);
   });
 
   tg.onText(/\/nextbet|⏳ След. ставка/, async (msg) => {
-    await tgReply(msg.chat.id, `⏳ До следующей ставки: <b>${getTimeToNextBet()}</b>`);
+    await tgReply(msg.chat.id, `⏳ Ставка через: ${getTimeToNextBet()}`);
   });
 
   tg.onText(/\/startbot|▶ Старт/, async (msg) => {
-    if (!isWorkingHours()) {
-      await tgReply(msg.chat.id, '⏰ Нерабочее время. Бот работает 09:00–00:00 МСК.');
-      return;
-    }
-    _userBotOn = true;
-    await saveState();
+    _userBotOn = true; await saveState();
     await tgReply(msg.chat.id, '▶ Бот запущен');
   });
 
   tg.onText(/\/stopbot|⏹ Стоп/, async (msg) => {
-    _userBotOn = false;
-    await saveState();
+    _userBotOn = false; await saveState();
     await tgReply(msg.chat.id, '■ Бот остановлен');
   });
 
   tg.onText(/\/reset|🔄 Сброс/, async (msg) => {
-    state = defaultState();
-    roundPlaced = null;
-    await saveState();
-    await tgReply(msg.chat.id, '↺ Сброс. Баланс: $100');
-  });
-
-  tg.onText(/\/help/, async (msg) => {
-    const text = [
-      '<b>Команды:</b>',
-      '/balance – Баланс и статистика',
-      '/status – Текущий статус',
-      '/price – Цена BTC',
-      '/nextbet – Время до следующей ставки',
-      '/startbot – Запустить бота',
-      '/stopbot – Остановить бота',
-      '/reset – Сбросить баланс до $100',
-      '/help – Эта справка',
-    ].join('\n');
-    await tgReply(msg.chat.id, text);
+    state = defaultState(); roundPlaced = null; await saveState();
+    await tgReply(msg.chat.id, '↺ Сброс. $100');
   });
 }
 
 // ── START ─────────────────────────────────────────────────────────────
 async function start() {
-  console.log('🤖 BTC 15M Bot starting...');
-  console.log('[INIT] Checking environment...');
+  console.log('🤖 BTC 15M Bot — СТАВКА КАЖДЫЙ РАУНД');
 
-  // Init Firebase
-  const fbOk = initFirebase();
-  if (!fbOk) {
-    console.error('[FATAL] Firebase init failed. Check env vars.');
-  }
+  initFirebase();
+  initTelegram();
 
-  // Init Telegram
-  const tgOk = initTelegram();
-  if (!tgOk) {
-    console.error('[FATAL] Telegram init failed. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.');
-  }
-
-  if (!fbOk && !tgOk) {
-    console.error('[FATAL] Nothing works. Exiting.');
-    process.exit(1);
-  }
-
-  // Load state
-  console.log('[INIT] Loading state...');
   state = await loadState();
-  console.log(`[INIT] State loaded. Balance: $${state.wallet.balance.toFixed(2)}`);
+  console.log(`[INIT] Balance: $${state.wallet.balance.toFixed(2)}`);
 
-  // Connect price feed
-  console.log('[INIT] Connecting price feed...');
   connectPriceWS();
+  await fetchPriceFallback();
+  console.log(`[INIT] BTC: $${Math.round(currentPrice)}`);
 
-  // Start fallback price fetcher
-  setTimeout(fetchPriceFallback, 10000);
-
-  // Setup listeners
   if (firebaseReady) listenForCommands();
   setupTelegramListeners();
 
-  // Start main loop
   botStarted = true;
-  setInterval(tick, 5000);
-  console.log('[INIT] Main loop started (tick every 5s)');
 
-  // Heartbeat
+  setInterval(tick, 3000);
+
   setInterval(async () => {
     if (!firebaseReady) return;
-    try {
-      await db.ref('btc15m/heartbeat').set({
-        ts: Date.now(),
-        working: isWorkingHours(),
-        userBotOn: _userBotOn,
-        shouldRun: shouldBotRun(),
-      });
-    } catch(e) {}
+    try { await db.ref('btc15m/heartbeat').set({ ts:Date.now(), working:isWorkingHours(), userBotOn:_userBotOn, shouldRun:shouldBotRun() }); } catch(e) {}
   }, 30000);
 
-  // Welcome message
-  const hourMSK = (new Date().getUTCHours() + 3) % 24;
-  if (tgOk) {
-    const msg = [
-      '🚀 <b>BTC 15M Бот запущен</b>',
-      `💰 Баланс: $${state.wallet.balance.toFixed(2)}`,
-      `⏰ МСК: ${hourMSK}:XX`,
-      `📅 Расписание: 09:00–00:00`,
-      `💵 Ставка: $${FIXED_BET} фикс`,
-      `📈 BTC: $${Math.round(currentPrice)}`,
-      `⏳ До ставки: ${getTimeToNextBet()}`,
-    ].join('\n');
-    await tgSend(msg);
-    console.log('[INIT] Welcome message sent to Telegram');
-  }
-
-  // First tick
+  await tgSend(`🚀 <b>BTC 15M</b>\n💰 $${state.wallet.balance.toFixed(2)}\n💵 Ставка: $${FIXED_BET}\n📅 09:00–00:00 МСК\n🔄 КАЖДЫЕ 15 МИН`);
   await tick();
-  console.log('[INIT] Bot fully started');
 }
 
-start().catch(e => {
-  console.error('[FATAL]', e);
-  process.exit(1);
-});
+start().catch(e => { console.error('[FATAL]', e); process.exit(1); });
