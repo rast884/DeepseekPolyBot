@@ -91,8 +91,6 @@ function initFirebase() {
 const WIN_MULT = 0.92;
 const ROUND_MS = 15 * 60 * 1000;
 const FIXED_BET = 5;
-const WORK_START_UTC = 6;
-const WORK_END_UTC = 21;
 
 // ── STATE ─────────────────────────────────────────────────────────────
 let state = null;
@@ -102,7 +100,6 @@ let wsConnected = false;
 let roundPlaced = null;
 let _userBotOn = true;
 let botStarted = false;
-let lastTickLog = 0;
 
 function defaultState() {
   return {
@@ -116,14 +113,46 @@ function defaultState() {
   };
 }
 
-// ── HELPERS ───────────────────────────────────────────────────────────
-function isWorkingHours() {
-  const h = new Date().getUTCHours();
-  return h >= WORK_START_UTC && h < WORK_END_UTC;
+// ── КАЛЕНДАРЬ ─────────────────────────────────────────────────────────
+function getTimeCategory() {
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Вс, 1=Пн, ..., 6=Сб
+  const hourUTC = now.getUTCHours();
+  const hourMSK = (hourUTC + 3) % 24;
+
+  // Выходные: Сб(6) Вс(0) — бот не работает
+  if (day === 0 || day === 6) {
+    return { allowed: false, reason: 'Выходной', quality: 0 };
+  }
+
+  // Пятница после 21:00 МСК (18:00 UTC) — фиксация прибыли
+  if (day === 5 && hourMSK >= 21) {
+    return { allowed: false, reason: 'Вечер пятницы', quality: 0 };
+  }
+
+  // Прайм-тайм 17:00–23:00 МСК (14:00–20:00 UTC) — максимальная ликвидность
+  if (hourMSK >= 17 && hourMSK < 23) {
+    return { allowed: true, reason: 'Прайм-тайм', quality: 5 };
+  }
+
+  // Европейская сессия 12:00–17:00 МСК (9:00–14:00 UTC)
+  if (hourMSK >= 12 && hourMSK < 17) {
+    return { allowed: true, reason: 'Европа', quality: 4 };
+  }
+
+  // Утро 09:00–12:00 МСК (6:00–9:00 UTC) — низкая ликвидность
+  if (hourMSK >= 9 && hourMSK < 12) {
+    return { allowed: true, reason: 'Утро', quality: 2 };
+  }
+
+  // Ночь 00:00–09:00 МСК
+  return { allowed: false, reason: 'Ночь', quality: 0 };
 }
 
+// ── HELPERS ───────────────────────────────────────────────────────────
 function shouldBotRun() {
-  return _userBotOn && isWorkingHours();
+  const tc = getTimeCategory();
+  return _userBotOn && tc.allowed;
 }
 
 async function loadState() {
@@ -178,7 +207,6 @@ function connectPriceWS() {
     const ws = new WebSocket('wss://ws-live-data.polymarket.com');
     ws.on('open', () => {
       wsConnected = true;
-      console.log('[WS] Connected');
       ws.send(JSON.stringify({ action:'subscribe', subscriptions:[{ topic:'crypto_prices_chainlink', type:'*', filters:JSON.stringify({ symbol:'btc/usd' }) }] }));
     });
     ws.on('message', (data) => {
@@ -229,34 +257,112 @@ async function fetchPolymarketSentiment() {
   } catch(e) {}
 }
 
-// ── AI SIGNAL ─────────────────────────────────────────────────────────
+// ── ИНДИКАТОРЫ ───────────────────────────────────────────────────────
+function calcATR(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  let sum = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    sum += Math.abs(prices[i] - prices[i - 1]);
+  }
+  return sum / period;
+}
+
+// ── СИГНАЛ С ТРОЙНЫМ ФИЛЬТРОМ ────────────────────────────────────────
 function aiSignal() {
-  if (priceBuffer.length < 2) {
-    return { direction: 'UP', confidence: 55, reason: 'UP (по умолчанию)', score: 0.5 };
+  if (priceBuffer.length < 60) {
+    return { direction: 'UP', skip: true, reason: 'Недостаточно данных', score: 0, filters: {} };
   }
-  let score = 0;
-  const signals = [];
-  if (priceBuffer.length >= 10) {
-    const recent = priceBuffer.slice(-5);
-    const older = priceBuffer.slice(-10, -5);
-    const recentAvg = recent.reduce((a,b) => a+b, 0) / recent.length;
-    const olderAvg = older.reduce((a,b) => a+b, 0) / older.length;
-    if (recentAvg > olderAvg) { score += 1; signals.push('Цена▲'); }
-    else { score -= 1; signals.push('Цена▼'); }
+
+  const prices = priceBuffer.slice(-120);
+  const tc = getTimeCategory();
+  const filters = { trend: false, pm: false, atr: false };
+  const details = [];
+
+  // 1. ФИЛЬТР ТРЕНДА — цена прошла > $80 за 30 минут
+  const recent30 = prices.slice(-60); // ~30 мин при тике каждые 30 сек
+  const older30 = prices.slice(-120, -60);
+  if (recent30.length >= 10 && older30.length >= 10) {
+    const recentAvg = recent30.reduce((a,b) => a+b, 0) / recent30.length;
+    const olderAvg = older30.reduce((a,b) => a+b, 0) / older30.length;
+    const trendStrength = recentAvg - olderAvg;
+    const absTrend = Math.abs(trendStrength);
+
+    if (absTrend > 80) {
+      filters.trend = true;
+      details.push(`Тренд $${absTrend.toFixed(0)}`);
+    } else {
+      details.push(`Тренд слабый $${absTrend.toFixed(0)}`);
+    }
   }
-  if (priceBuffer.length >= 3) {
-    const last = priceBuffer[priceBuffer.length - 1];
-    const prev = priceBuffer[priceBuffer.length - 3];
-    if (last > prev) { score += 1; signals.push('Движ▲'); }
-    else { score -= 1; signals.push('Движ▼'); }
+
+  // 2. ФИЛЬТР POLYMARKET — дисбаланс > 20%
+  const pmSpread = pmUpProb - pmDownProb;
+  if (Math.abs(pmSpread) > 0.20) {
+    filters.pm = true;
+    details.push(`PM: ${pmUpProb > pmDownProb ? '▲' : '▼'}${(Math.abs(pmSpread)*100).toFixed(0)}%`);
+  } else {
+    details.push(`PM: ${(pmSpread*100).toFixed(0)}%`);
   }
-  if (pmUpProb > 0.55) { score += 2; signals.push(`PM▲${(pmUpProb*100).toFixed(0)}%`); }
-  else if (pmUpProb < 0.45) { score -= 2; signals.push(`PM▼${(pmDownProb*100).toFixed(0)}%`); }
-  else if (pmUpProb > 0.50) { score += 1; signals.push(`PM▲${(pmUpProb*100).toFixed(0)}%`); }
-  else if (pmUpProb < 0.50) { score -= 1; signals.push(`PM▼${(pmDownProb*100).toFixed(0)}%`); }
-  const dir = score >= 0 ? 'UP' : 'DOWN';
-  const conf = Math.min(70, Math.max(53, 55 + Math.abs(score) * 3));
-  return { direction: dir, confidence: conf, reason: `${dir} ${conf.toFixed(0)}% | ${signals.join(', ')}`, score };
+
+  // 3. ФИЛЬТР ВОЛАТИЛЬНОСТИ — ATR > 0.05%
+  const atr = calcATR(prices, 14);
+  const atrPercent = atr ? (atr / currentPrice) * 100 : 0;
+  if (atrPercent > 0.05) {
+    filters.atr = true;
+    details.push(`ATR: ${atrPercent.toFixed(3)}%`);
+  } else {
+    details.push(`ATR низкий: ${atrPercent.toFixed(3)}%`);
+  }
+
+  // ТРЕБУЕМ ВЫПОЛНЕНИЕ ВСЕХ ТРЁХ ФИЛЬТРОВ
+  // + бонус: в утренние часы (quality <= 2) требуем больший тренд ($120+)
+  let trendPass = filters.trend;
+  if (tc.quality <= 2) {
+    const recent30_2 = prices.slice(-60);
+    const older30_2 = prices.slice(-120, -60);
+    if (recent30_2.length >= 10 && older30_2.length >= 10) {
+      const recentAvg2 = recent30_2.reduce((a,b) => a+b, 0) / recent30_2.length;
+      const olderAvg2 = older30_2.reduce((a,b) => a+b, 0) / older30_2.length;
+      trendPass = Math.abs(recentAvg2 - olderAvg2) > 120;
+      if (!trendPass) details.push('Утро: нужен тренд $120+');
+    }
+  }
+
+  const allPass = trendPass && filters.pm && filters.atr;
+
+  if (!allPass) {
+    return {
+      direction: 'UP',
+      skip: true,
+      reason: `Фильтры: тренд=${trendPass?'✅':'❌'} PM=${filters.pm?'✅':'❌'} ATR=${filters.atr?'✅':'❌'} | ${details.join(' | ')} | ${tc.reason}`,
+      score: 0,
+      filters: { trend: trendPass, pm: filters.pm, atr: filters.atr }
+    };
+  }
+
+  // Определяем направление
+  const recentAvg = recent30.reduce((a,b) => a+b, 0) / recent30.length;
+  const olderAvg = older30.reduce((a,b) => a+b, 0) / older30.length;
+  const trendDir = recentAvg > olderAvg ? 'UP' : 'DOWN';
+
+  // Если Polymarket противоречит тренду — пропускаем
+  if (trendDir === 'UP' && pmDownProb > 0.55) {
+    return { direction: 'UP', skip: true, reason: 'PM против тренда', score: 0, filters };
+  }
+  if (trendDir === 'DOWN' && pmUpProb > 0.55) {
+    return { direction: 'DOWN', skip: true, reason: 'PM против тренда', score: 0, filters };
+  }
+
+  return {
+    direction: trendDir,
+    skip: false,
+    reason: `${trendDir} | Тренд+PM+ATR ✅ | ${tc.reason} (Q${tc.quality})`,
+    score: tc.quality * 2,
+    filters,
+    details: details.join(' | '),
+    quality: tc.quality,
+    timeCategory: tc.reason
+  };
 }
 
 // ── BOT LOGIC ─────────────────────────────────────────────────────────
@@ -269,22 +375,51 @@ async function placeBet(rid) {
     _userBotOn = false; await saveState(); return;
   }
   roundPlaced = rid;
+
   if (!wsConnected) await fetchPriceFallback();
   await fetchPolymarketSentiment();
+
   const sig = aiSignal();
+
+  if (sig.skip) {
+    console.log(`[BOT] ⏭ SKIP: ${sig.reason}`);
+    state.lastRoundId = rid;
+    state.history.unshift({
+      id: rid, direction: sig.direction || 'NONE', confidence: 0,
+      reason: sig.reason, betAmount: 0, startPrice: currentPrice,
+      endPrice: null, window: fmtWindow(rid), result: 'skip', pnl: 0,
+      balanceAfter: state.wallet.balance, ts: new Date().toISOString()
+    });
+    if (state.history.length > 200) state.history = state.history.slice(0, 200);
+    await saveState();
+    return;
+  }
+
   state.wallet.balance = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
   state.wallet.totalBet += FIXED_BET;
   state.lastRoundId = rid;
   state.pendingBet = {
-    id:rid, direction:sig.direction, confidence:sig.confidence,
-    reason:sig.reason, betAmount:FIXED_BET, startPrice:currentPrice,
-    endPrice:null, window:fmtWindow(rid), result:'pending', pnl:0,
-    ts:new Date().toISOString()
+    id: rid, direction: sig.direction, confidence: Math.min(85, 60 + sig.quality * 5),
+    reason: sig.reason, betAmount: FIXED_BET, startPrice: currentPrice,
+    endPrice: null, window: fmtWindow(rid), result: 'pending', pnl: 0,
+    ts: new Date().toISOString()
   };
   await saveState();
+
   const dirEmoji = sig.direction === 'UP' ? '🟢' : '🔴';
-  console.log(`[BOT] BET: ${sig.direction} $${FIXED_BET} | ${fmtWindow(rid)}`);
-  await tgSend(`${dirEmoji} <b>${sig.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'}</b> · ${fmtWindow(rid)}\nВход: $${Math.round(currentPrice)} · Ставка: $${FIXED_BET}\nУверенность: ${sig.confidence}%\nБаланс: $${state.wallet.balance.toFixed(2)}`);
+  const filterStatus = sig.filters
+    ? `Тренд:✅ | PM:✅ | ATR:✅`
+    : 'Все фильтры пройдены';
+
+  console.log(`[BOT] ✅ BET: ${sig.direction} $${FIXED_BET} | ${fmtWindow(rid)} | ${sig.reason}`);
+  await tgSend([
+    `${dirEmoji} <b>${sig.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'}</b> · ${fmtWindow(rid)}`,
+    `Вход: $${Math.round(currentPrice)} · Ставка: $${FIXED_BET}`,
+    `${filterStatus}`,
+    `⚡ ${sig.timeCategory} (Q${sig.quality})`,
+    `${sig.details || ''}`,
+    `Баланс: $${state.wallet.balance.toFixed(2)}`,
+  ].join('\n'));
 }
 
 async function resolveBet() {
@@ -294,6 +429,9 @@ async function resolveBet() {
   bet.endPrice = currentPrice;
   const up = bet.endPrice >= bet.startPrice;
   const won = (bet.direction === 'UP' && up) || (bet.direction === 'DOWN' && !up);
+  const priceChange = bet.endPrice - bet.startPrice;
+  const priceChangePct = ((priceChange / bet.startPrice) * 100).toFixed(3);
+
   if (won) {
     const p = parseFloat((FIXED_BET * WIN_MULT).toFixed(2));
     state.wallet.balance = parseFloat((state.wallet.balance + FIXED_BET + p).toFixed(2));
@@ -302,17 +440,17 @@ async function resolveBet() {
     if (state.stats.curStreak > state.stats.bestStreak) state.stats.bestStreak = state.stats.curStreak;
     bet.result = 'win'; bet.pnl = p;
     console.log(`[BOT] WIN +$${p.toFixed(2)} | Balance: $${state.wallet.balance.toFixed(2)}`);
-    await tgSend(`✅ <b>ВЫИГРЫШ</b> · ${bet.window}\n${bet.direction} · Вход: $${Math.round(bet.startPrice)} → Выход: $${Math.round(bet.endPrice)}\nПрибыль: +$${p.toFixed(2)} · Баланс: $${state.wallet.balance.toFixed(2)}\nСерия: ${state.stats.curStreak} · W/L: ${state.wallet.wins}/${state.wallet.losses}`);
+    await tgSend(`✅ <b>ВЫИГРЫШ</b> · ${bet.window}\n${bet.direction} · $${Math.round(bet.startPrice)} → $${Math.round(bet.endPrice)}\nΔ: ${priceChange >= 0 ? '+' : ''}$${priceChange.toFixed(2)} (${priceChangePct}%)\nПрибыль: +$${p.toFixed(2)} · Баланс: $${state.wallet.balance.toFixed(2)}\nСерия: ${state.stats.curStreak} · W/L: ${state.wallet.wins}/${state.wallet.losses}`);
   } else {
     state.wallet.pnl = parseFloat((state.wallet.pnl - FIXED_BET).toFixed(2));
     state.wallet.losses++; state.stats.curStreak = 0; state.stats.totalLoss += FIXED_BET;
     bet.result = 'loss'; bet.pnl = -FIXED_BET;
     console.log(`[BOT] LOSS -$${FIXED_BET} | Balance: $${state.wallet.balance.toFixed(2)}`);
-    await tgSend(`❌ <b>ПРОИГРЫШ</b> · ${bet.window}\n${bet.direction} · Вход: $${Math.round(bet.startPrice)} → Выход: $${Math.round(bet.endPrice)}\nПрибыль: -$${FIXED_BET} · Баланс: $${state.wallet.balance.toFixed(2)}\nW/L: ${state.wallet.wins}/${state.wallet.losses}`);
+    await tgSend(`❌ <b>ПРОИГРЫШ</b> · ${bet.window}\n${bet.direction} · $${Math.round(bet.startPrice)} → $${Math.round(bet.endPrice)}\nΔ: ${priceChange >= 0 ? '+' : ''}$${priceChange.toFixed(2)} (${priceChangePct}%)\nУбыток: -$${FIXED_BET} · Баланс: $${state.wallet.balance.toFixed(2)}\nW/L: ${state.wallet.wins}/${state.wallet.losses}`);
   }
   bet.balanceAfter = state.wallet.balance;
   state.history.unshift({ ...bet });
-  if (state.history.length > 200) state.history = state.history.slice(0,200);
+  if (state.history.length > 200) state.history = state.history.slice(0, 200);
   state.pendingBet = null;
   await saveState();
   if (state.wallet.balance < FIXED_BET) {
@@ -355,7 +493,7 @@ function setupTelegramListeners() {
   if (!tg) return;
 
   tg.onText(/\/start/, async (msg) => {
-    await tgReply(msg.chat.id, '🤖 <b>BTC 15M Bot</b>\nСтавка каждые 15 минут\n\nКоманды:\n/balance — Баланс\n/status — Статус\n/price — Цена BTC\n/nextbet — Время до ставки\n/startbot — Запуск\n/stopbot — Остановка\n/reset — Сброс');
+    await tgReply(msg.chat.id, '🤖 <b>BTC 15M v3</b>\nТройной фильтр + Календарь\n\n/balance /status /price /nextbet\n/startbot /stopbot /reset');
   });
 
   tg.onText(/\/balance|💰 Баланс/, async (msg) => {
@@ -363,16 +501,15 @@ function setupTelegramListeners() {
     const w = state.wallet; const s = state.stats;
     const totalBets = w.wins + w.losses;
     const winRate = totalBets > 0 ? ((w.wins / totalBets) * 100).toFixed(0) : 0;
-    await tgReply(msg.chat.id, `<b>💰 БАЛАНС</b>\n\nБаланс: $${w.balance.toFixed(2)}\nP&L: ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}\n\nВсего ставок: ${totalBets}\nВыигрышей: ${w.wins}\nПроигрышей: ${w.losses}\nWin rate: ${winRate}%\n\nТекущая серия: ${s.curStreak}\nРекорд: ${s.bestStreak}`);
+    await tgReply(msg.chat.id, `<b>💰 БАЛАНС</b>\n\nБаланс: $${w.balance.toFixed(2)}\nP&L: ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}\n\nСтавок: ${totalBets}\nПобед: ${w.wins}\nПоражений: ${w.losses}\nWin rate: ${winRate}%\n\nСерия: ${s.curStreak}\nРекорд: ${s.bestStreak}`);
   });
 
   tg.onText(/\/status|📊 Статус/, async (msg) => {
     if (!state) { await tgReply(msg.chat.id, '⏳ Загрузка...'); return; }
     const now = new Date();
     const timeMSK = now.toLocaleTimeString('ru-RU', { hour:'2-digit', minute:'2-digit', second:'2-digit', timeZone:'Europe/Moscow' });
-    const dateMSK = now.toLocaleDateString('ru-RU', { day:'numeric', month:'long', year:'numeric', timeZone:'Europe/Moscow' });
-    const w = state.wallet;
-    const s = state.stats;
+    const tc = getTimeCategory();
+    const w = state.wallet; const s = state.stats;
     const totalBets = w.wins + w.losses;
     const winRate = totalBets > 0 ? ((w.wins / totalBets) * 100).toFixed(0) : 0;
     const bet = state.pendingBet;
@@ -385,63 +522,39 @@ function setupTelegramListeners() {
       const currentPx = Math.round(currentPrice);
       const priceDiff = currentPx - entryPrice;
       const diffSign = priceDiff >= 0 ? '+' : '';
-      const diffUSD = diffSign + priceDiff;
-      const pnlEstimate = bet.direction === 'UP' ? priceDiff : -priceDiff;
-      const pnlSign = pnlEstimate >= 0 ? '+' : '';
-      activeBetInfo = `\n<b>📌 АКТИВНАЯ СТАВКА</b>\n${dirEmoji} ${bet.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'} · ${bet.window}\nВход: $${entryPrice} → Сейчас: $${currentPx} (${diffUSD})\nСумма: $${bet.betAmount} · Уверенность: ${bet.confidence}%\nОценка P&L: ${pnlSign}$${pnlEstimate.toFixed(0)}`;
-    } else {
-      const lastBet = state.history[0];
-      if (lastBet && lastBet.result !== 'skip') {
-        const resultEmoji = lastBet.result === 'win' ? '✅' : '❌';
-        const resultText = lastBet.result === 'win' ? 'ВЫИГРЫШ' : 'ПРОИГРЫШ';
-        const pnlSign = lastBet.pnl >= 0 ? '+' : '';
-        activeBetInfo = `\n<b>📌 ПОСЛЕДНЯЯ СТАВКА</b>\n${resultEmoji} ${resultText} · ${lastBet.window}\n${lastBet.direction} · Вход: $${Math.round(lastBet.startPrice)} → Выход: $${Math.round(lastBet.endPrice)}\nПрибыль: ${pnlSign}$${lastBet.pnl.toFixed(2)}`;
-      } else if (lastBet && lastBet.result === 'skip') {
-        activeBetInfo = `\n<b>📌 ПОСЛЕДНЯЯ СТАВКА</b>\n⏭ Пропуск · ${lastBet.window}`;
-      }
+      activeBetInfo = `\n<b>📌 АКТИВНАЯ СТАВКА</b>\n${dirEmoji} ${bet.direction} · ${bet.window}\nВход: $${entryPrice} → $${currentPx} (${diffSign}${priceDiff})\nСумма: $${bet.betAmount}`;
     }
 
-    const text = [
-      `<b>📊 СТАТУС БОТА</b>`,
+    await tgReply(msg.chat.id, [
+      `<b>📊 СТАТУС</b>`,
+      `🕐 ${timeMSK} МСК`,
       ``,
-      `🕐 ${dateMSK} · ${timeMSK} МСК`,
+      `🤖 ${_userBotOn ? '✅ АКТИВЕН' : '⏸ ОСТАНОВЛЕН'}`,
+      `📅 ${tc.allowed ? '✅ ' + tc.reason : '🚫 ' + tc.reason} (Q${tc.quality})`,
+      `📈 BTC: $${currentPrice.toLocaleString('en-US', {minimumFractionDigits:2})}`,
       ``,
-      `───────────────`,
+      `💰 $${w.balance.toFixed(2)} · P&L ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}`,
+      `📊 Ставок: ${totalBets} · WR: ${winRate}%`,
+      `🔥 Серия: ${s.curStreak} · 🏆 ${s.bestStreak}`,
       ``,
-      `🤖 Статус: ${_userBotOn ? '✅ АКТИВЕН' : '⏸ ОСТАНОВЛЕН'}`,
-      `⏰ Расписание: ${isWorkingHours() ? '✅ Рабочее время' : '🌙 Нерабочее время'}`,
-      ``,
-      `📈 <b>BTC:</b> $${currentPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}`,
-      ``,
-      `───────────────`,
-      ``,
-      `💰 Баланс: $${w.balance.toFixed(2)} · P&L: ${w.pnl >= 0 ? '+' : ''}$${w.pnl.toFixed(2)}`,
-      `📊 Ставок: ${totalBets} · Win rate: ${winRate}%`,
-      `✅ Выигрышей: ${w.wins} · ❌ Проигрышей: ${w.losses}`,
-      `🔥 Серия: ${s.curStreak} · 🏆 Рекорд: ${s.bestStreak}`,
-      ``,
-      `⏳ До следующей ставки: <b>${getTimeToNextBet()}</b>`,
-      activeBetInfo,
-    ].join('\n');
-
-    await tgReply(msg.chat.id, text);
+      `⏳ Ставка через: ${getTimeToNextBet()}`,
+      `🎯 Фильтры: Тренд $80+ | PM 20%+ | ATR 0.05%+`,
+      activeBetInfo
+    ].join('\n'));
   });
 
   tg.onText(/\/price|📈 Цена BTC/, async (msg) => {
-    const change = priceBuffer.length >= 2
-      ? currentPrice - priceBuffer[priceBuffer.length - 2]
-      : 0;
-    const sign = change >= 0 ? '+' : '';
-    await tgReply(msg.chat.id, `<b>📈 BTC</b>\n\nЦена: $${currentPrice.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}\nИзменение: ${sign}$${change.toFixed(2)}`);
+    await tgReply(msg.chat.id, `📈 BTC: $${currentPrice.toLocaleString('en-US', {minimumFractionDigits:2})}`);
   });
 
   tg.onText(/\/nextbet|⏳ След. ставка/, async (msg) => {
-    await tgReply(msg.chat.id, `<b>⏳ ВРЕМЯ ДО СТАВКИ</b>\n\nСледующая ставка через: <b>${getTimeToNextBet()}</b>\n\nСтавка каждые 15 минут\nРасписание: 09:00–00:00 МСК`);
+    const tc = getTimeCategory();
+    await tgReply(msg.chat.id, `⏳ Ставка через: ${getTimeToNextBet()}\n📅 ${tc.reason} | ${tc.allowed ? '✅ Торгуем' : '🚫 Пропуск'}`);
   });
 
   tg.onText(/\/startbot|▶ Старт/, async (msg) => {
     _userBotOn = true; await saveState();
-    await tgReply(msg.chat.id, '▶ Бот запущен\nСтавки каждые 15 минут');
+    await tgReply(msg.chat.id, '▶ Бот запущен');
   });
 
   tg.onText(/\/stopbot|⏹ Стоп/, async (msg) => {
@@ -451,30 +564,57 @@ function setupTelegramListeners() {
 
   tg.onText(/\/reset|🔄 Сброс/, async (msg) => {
     state = defaultState(); roundPlaced = null; await saveState();
-    await tgReply(msg.chat.id, '↺ Сброс выполнен\nБаланс: $100.00');
+    await tgReply(msg.chat.id, '↺ Сброс. Баланс: $100');
   });
 }
 
 // ── START ─────────────────────────────────────────────────────────────
 async function start() {
-  console.log('🤖 BTC 15M Bot starting...');
+  console.log('🤖 BTC 15M v3 — Тройной фильтр + Календарь');
+
   initFirebase();
   initTelegram();
+
   state = await loadState();
   console.log(`[INIT] Balance: $${state.wallet.balance.toFixed(2)}`);
+
   connectPriceWS();
   await fetchPriceFallback();
   console.log(`[INIT] BTC: $${Math.round(currentPrice)}`);
+
   if (firebaseReady) listenForCommands();
   setupTelegramListeners();
+
   botStarted = true;
+
   setInterval(tick, 3000);
+
   setInterval(async () => {
     if (!firebaseReady) return;
-    try { await db.ref('btc15m/heartbeat').set({ ts:Date.now(), working:isWorkingHours(), userBotOn:_userBotOn, shouldRun:shouldBotRun() }); } catch(e) {}
+    const tc = getTimeCategory();
+    try { await db.ref('btc15m/heartbeat').set({ ts:Date.now(), working:tc.allowed, userBotOn:_userBotOn, shouldRun:shouldBotRun(), timeCategory:tc.reason, quality:tc.quality }); } catch(e) {}
   }, 30000);
-  await tgSend(`🚀 <b>BTC 15M Бот запущен</b>\n\n💰 Баланс: $${state.wallet.balance.toFixed(2)}\n💵 Ставка: $${FIXED_BET} фикс\n📅 Расписание: 09:00–00:00 МСК\n⏱ Каждые 15 минут`);
-  console.log('[INIT] Bot started');
+
+  const tc = getTimeCategory();
+  await tgSend([
+    `🚀 <b>BTC 15M v3</b>`,
+    `💰 $${state.wallet.balance.toFixed(2)}`,
+    `💵 Ставка: $${FIXED_BET}`,
+    ``,
+    `🎯 <b>Тройной фильтр:</b>`,
+    `1. Тренд $80+ за 30 мин`,
+    `2. Polymarket дисбаланс > 20%`,
+    `3. ATR > 0.05%`,
+    ``,
+    `📅 <b>Календарь:</b>`,
+    `✅ Вт–Чт 17:00–23:00 МСК — прайм-тайм`,
+    `✅ Пн, Пт до 21:00 — Европа`,
+    `⚠️ Утро 09:00–12:00 — усиленный фильтр`,
+    `🚫 Сб–Вс, Пт вечер — выходной`,
+    ``,
+    `Сейчас: ${tc.reason} | ${tc.allowed ? '✅ Торгуем' : '🚫 Пропуск'}`,
+  ].join('\n'));
+
   await tick();
 }
 
