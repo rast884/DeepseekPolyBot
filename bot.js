@@ -219,7 +219,7 @@ async function fetchPolymarketSentiment() {
   } catch(e) {}
 }
 
-// ── ADVANCED SIGNAL (RSI + MACD + TREND + PM) ────────────────────────
+// ── ADVANCED SIGNAL v2.1 (Консенсус + RSI-фильтр + Анти-флет) ────────
 function calcRSI(prices, period = 14) {
   if (prices.length < period + 1) return 50;
   const changes = [];
@@ -229,86 +229,104 @@ function calcRSI(prices, period = 14) {
   const gains = changes.filter(c => c > 0).reduce((a,b) => a+b, 0) / period;
   const losses = changes.filter(c => c < 0).map(c => Math.abs(c)).reduce((a,b) => a+b, 0) / period;
   if (losses === 0) return 100;
-  const rs = gains / losses;
-  return 100 - (100 / (1 + rs));
+  return 100 - (100 / (1 + gains/losses));
 }
 
 function calcEMA(prices, period) {
   if (prices.length < period) return prices[prices.length - 1];
   const k = 2 / (period + 1);
   let ema = prices.slice(0, period).reduce((a,b) => a+b, 0) / period;
-  for (let i = period; i < prices.length; i++) {
-    ema = prices[i] * k + ema * (1 - k);
-  }
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
   return ema;
 }
 
 function aiSignal() {
-  if (priceBuffer.length < 20) {
-    // Мало данных — ставим по последней свече
-    if (priceBuffer.length >= 2) {
-      const dir = priceBuffer[priceBuffer.length-1] >= priceBuffer[priceBuffer.length-2] ? 'UP' : 'DOWN';
-      return { direction: dir, confidence: 52, reason: `${dir} (min data)`, score: 0 };
-    }
-    return { direction: 'UP', confidence: 50, reason: 'UP (default)', score: 0 };
+  if (priceBuffer.length < 30) {
+    return { direction: 'UP', confidence: 50, reason: 'Жду данные...', score: 0, skip: false };
   }
 
   let score = 0;
   const signals = [];
+  const votes = { up: 0, down: 0 };
 
-  // 1. RSI
+  // 1. RSI (перекуплен/перепродан)
   const rsi = calcRSI(priceBuffer);
-  if (rsi < 35) { score += 3; signals.push(`RSI:${rsi.toFixed(0)}▲`); }
-  else if (rsi > 65) { score -= 3; signals.push(`RSI:${rsi.toFixed(0)}▼`); }
-  else if (rsi > 50) { score += 1; signals.push(`RSI:${rsi.toFixed(0)}▲`); }
-  else { score -= 1; signals.push(`RSI:${rsi.toFixed(0)}▼`); }
+  if (rsi < 30) { score += 2; votes.up++; signals.push(`RSI:${rsi.toFixed(0)}▲`); }
+  else if (rsi > 70) { score -= 2; votes.down++; signals.push(`RSI:${rsi.toFixed(0)}▼`); }
+  else if (rsi > 50) { score += 1; votes.up++; signals.push(`RSI:${rsi.toFixed(0)}▲`); }
+  else { score -= 1; votes.down++; signals.push(`RSI:${rsi.toFixed(0)}▼`); }
 
   // 2. EMA тренд
   const ema9 = calcEMA(priceBuffer, 9);
   const ema21 = calcEMA(priceBuffer, 21);
-  if (ema9 > ema21) { score += 2; signals.push('EMA▲'); }
-  else { score -= 2; signals.push('EMA▼'); }
+  if (ema9 > ema21) { score += 2; votes.up++; signals.push('EMA▲'); }
+  else { score -= 2; votes.down++; signals.push('EMA▼'); }
 
-  // 3. MACD (упрощённый)
+  // 3. MACD
   const ema12 = calcEMA(priceBuffer, 12);
   const ema26 = calcEMA(priceBuffer, 26);
   const macd = ema12 - ema26;
-  if (macd > 0) { score += 1.5; signals.push('MACD▲'); }
-  else { score -= 1.5; signals.push('MACD▼'); }
+  if (macd > 0) { score += 1.5; votes.up++; signals.push('MACD▲'); }
+  else { score -= 1.5; votes.down++; signals.push('MACD▼'); }
 
-  // 4. Краткосрочный моментум
-  if (priceBuffer.length >= 6) {
+  // 4. Краткосрочный моментум (5 мин)
+  if (priceBuffer.length >= 10) {
     const now5 = priceBuffer.slice(-5).reduce((a,b)=>a+b,0)/5;
     const prev5 = priceBuffer.slice(-10, -5).reduce((a,b)=>a+b,0)/5;
-    if (now5 > prev5) { score += 1.5; signals.push('5m▲'); }
-    else { score -= 1.5; signals.push('5m▼'); }
+    if (now5 > prev5) { score += 1.5; votes.up++; signals.push('5m▲'); }
+    else { score -= 1.5; votes.down++; signals.push('5m▼'); }
   }
 
   // 5. Polymarket
-  if (pmUpProb > 0.60) { score += 3; signals.push(`PM:${(pmUpProb*100).toFixed(0)}%▲`); }
-  else if (pmDownProb > 0.60) { score -= 3; signals.push(`PM:${(pmDownProb*100).toFixed(0)}%▼`); }
-  else if (pmUpProb > 0.52) { score += 1.5; signals.push(`PM:${(pmUpProb*100).toFixed(0)}%▲`); }
-  else if (pmDownProb > 0.52) { score -= 1.5; signals.push(`PM:${(pmDownProb*100).toFixed(0)}%▼`); }
+  if (pmUpProb > 0.60) { score += 2; votes.up++; signals.push(`PM:${(pmUpProb*100).toFixed(0)}%▲`); }
+  else if (pmDownProb > 0.60) { score -= 2; votes.down++; signals.push(`PM:${(pmDownProb*100).toFixed(0)}%▼`); }
+  else if (pmUpProb > 0.52) { score += 1; votes.up++; signals.push(`PM:${(pmUpProb*100).toFixed(0)}%▲`); }
+  else if (pmDownProb > 0.52) { score -= 1; votes.down++; signals.push(`PM:${(pmDownProb*100).toFixed(0)}%▼`); }
 
-  // 6. Волатильность
-  if (priceBuffer.length >= 20) {
-    const last20 = priceBuffer.slice(-20);
-    const high = Math.max(...last20);
-    const low = Math.min(...last20);
-    const range = ((high - low) / low) * 100;
-    if (range < 0.15) { score *= 0.5; signals.push(`Флет:${range.toFixed(2)}%`); }
-    else if (range > 0.5) { score *= 1.2; signals.push(`Вола:${range.toFixed(2)}%`); }
+  // 6. Волатильность — не влияет на голосование, только на confidence
+  let volatility = 0;
+  let isFlat = false;
+  if (priceBuffer.length >= 30) {
+    const last30 = priceBuffer.slice(-30);
+    const high = Math.max(...last30);
+    const low = Math.min(...last30);
+    volatility = ((high - low) / low) * 100;
+    if (volatility < 0.03) { isFlat = true; signals.push(`Флет:${volatility.toFixed(3)}%`); }
+    else if (volatility > 0.08) { signals.push(`Вола:${volatility.toFixed(2)}%`); }
   }
+
+  // Консенсус: сколько индикаторов согласны
+  const totalVotes = votes.up + votes.down;
+  const consensusUp = totalVotes > 0 ? votes.up / totalVotes : 0.5;
+  const consensusDown = totalVotes > 0 ? votes.down / totalVotes : 0.5;
 
   const dir = score > 0 ? 'UP' : 'DOWN';
   const absScore = Math.abs(score);
-  const conf = Math.min(80, Math.max(51, 50 + absScore * 3));
+
+  // Базовый confidence
+  let conf = Math.min(75, Math.max(45, 45 + absScore * 2.5));
+
+  // Штраф за слабый консенсус
+  const majority = Math.max(consensusUp, consensusDown);
+  if (majority < 0.6) conf -= 10;
+
+  // Штраф за флет
+  if (isFlat) conf -= 15;
+
+  // Бонус за сильный консенсус
+  if (majority >= 0.8 && !isFlat) conf += 5;
+
+  // Определяем skip ТОЛЬКО если уверенность упала ниже 40%
+  const skip = conf < 40;
+
+  console.log(`[SIGNAL] ${dir} | Score:${score.toFixed(1)} | RSI:${rsi.toFixed(0)} | Vol:${volatility.toFixed(3)}% | Cons:${majority.toFixed(0)}% | Conf:${conf.toFixed(0)}% | Skip:${skip}`);
 
   return {
     direction: dir,
     confidence: parseFloat(conf.toFixed(0)),
-    reason: `${dir} ${conf.toFixed(0)}% | ${signals.join(' | ')}`,
-    score: parseFloat(score.toFixed(1))
+    reason: `${dir} ${conf.toFixed(0)}% | ${signals.join(' | ')}${skip ? ' | ⚠СКИП' : ''}`,
+    score: parseFloat(absScore.toFixed(1)),
+    skip: skip
   };
 }
 
@@ -327,6 +345,21 @@ async function placeBet(rid) {
   if (!wsConnected) await fetchPriceFallback();
   await fetchPolymarketSentiment();
   const sig = aiSignal();
+
+  // ПРОПУСК при низкой уверенности
+  if (sig.skip) {
+    console.log(`[BOT] ⏭ SKIP ${fmtWindow(rid)} | ${sig.reason}`);
+    state.history.unshift({
+      id:rid, direction:sig.direction, confidence:sig.confidence,
+      reason:sig.reason, betAmount:0, startPrice:currentPrice,
+      endPrice:null, window:fmtWindow(rid), result:'skip', pnl:0,
+      balanceAfter:state.wallet.balance, ts:new Date().toISOString()
+    });
+    if (state.history.length > 200) state.history = state.history.slice(0,200);
+    state.lastRoundId = rid;
+    await saveState();
+    return;
+  }
 
   state.wallet.balance = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
   state.wallet.totalBet += FIXED_BET;
@@ -439,7 +472,7 @@ function setupTelegramListeners() {
   if (!tg) return;
 
   tg.onText(/\/start/, async (msg) => {
-    await tgReply(msg.chat.id, '🤖 <b>BTC 15M</b>\nСтавка $5 каждые 15 мин\nRSI + EMA + MACD + Polymarket');
+    await tgReply(msg.chat.id, '🤖 <b>BTC 15M v2.1</b>\nСтавка $5 каждые 15 мин\nRSI+EMA+MACD+Консенсус');
   });
 
   tg.onText(/\/balance|💰 Баланс/, async (msg) => {
@@ -494,7 +527,7 @@ function setupTelegramListeners() {
 
 // ── START ─────────────────────────────────────────────────────────────
 async function start() {
-  console.log('🤖 BTC 15M Bot v2.0 — RSI+EMA+MACD+PM');
+  console.log('🤖 BTC 15M Bot v2.1 — RSI+EMA+MACD+Consensus');
 
   initFirebase();
   initTelegram();
@@ -522,7 +555,7 @@ async function start() {
     try { await db.ref('btc15m/heartbeat').set({ ts:Date.now(), working:isWorkingHours(), userBotOn:_userBotOn, shouldRun:shouldBotRun() }); } catch(e) {}
   }, 30000);
 
-  await tgSend(`🚀 <b>BTC 15M v2.0</b>\n💰 $${state.wallet.balance.toFixed(2)}\n💵 Ставка: $5 / 15 мин\n📊 RSI+EMA+MACD+PM`);
+  await tgSend(`🚀 <b>BTC 15M v2.1</b>\n💰 $${state.wallet.balance.toFixed(2)}\n💵 Ставка: $5 / 15 мин\n📊 RSI+EMA+MACD+Консенсус`);
   console.log('[INIT] ✅ Bot is live');
   await tick();
 }
