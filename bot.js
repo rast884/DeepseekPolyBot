@@ -392,13 +392,19 @@ function aiSignal() {
 async function placeBet(rid) {
   if (roundPlaced === rid) return;
   if (!botStarted) return;
-  if (!shouldBotRun()) return;
+  if (!shouldBotRun()) {
+    // Уведомляем если бот должен работать, но не может
+    if (_userBotOn && !isWorkingHours()) {
+      console.log(`[BOT] Внерабочее время ${fmtWindow(rid)}`);
+    }
+    return;
+  }
   if (state.wallet.balance < FIXED_BET) {
     await tgSend('❌ Баланс < $5. Остановка.');
     _userBotOn = false; await saveState(); return;
   }
 
-  console.log(`[BOT] ██ НОВАЯ СТАВКА ${fmtWindow(rid)} ██`);
+  console.log(`[BOT] ██ АНАЛИЗ ${fmtWindow(rid)} ██`);
   roundPlaced = rid;
 
   if (!wsConnected) await fetchPriceFallback();
@@ -406,8 +412,45 @@ async function placeBet(rid) {
 
   const sig = aiSignal();
 
+  // Детальная информация о сигналах для логов
+  const spx = getSPXSignal();
+  const dxy = getDXYSignal();
+  const tweet = process.env.TWITTER_BEARER_TOKEN ? getTweetSignal() : { direction: null, score: 0, reason: 'Твиттер выкл' };
+  
+  // Считаем согласие для отчёта
+  const allSignals = [spx, dxy, tweet];
+  if (pmUpProb > 0.60 || pmDownProb > 0.60) {
+    allSignals.push({ 
+      direction: pmUpProb > 0.60 ? 'UP' : 'DOWN', 
+      score: pmUpProb > 0.60 ? 1 : -1, 
+      reason: `PM:${((pmUpProb > 0.60 ? pmUpProb : pmDownProb)*100).toFixed(0)}%` 
+    });
+  }
+  const activeSignals = allSignals.filter(s => s.direction !== null);
+  const upCount = activeSignals.filter(s => s.direction === 'UP').length;
+  const downCount = activeSignals.filter(s => s.direction === 'DOWN').length;
+
   if (sig.skip) {
-    console.log(`[BOT] ⏭ SKIP ${fmtWindow(rid)} | ${sig.reason}`);
+    // ПОДРОБНОЕ УВЕДОМЛЕНИЕ О ПРОПУСКЕ
+    const skipMsg = [
+      `⏭ <b>ПРОПУСК СТАВКИ</b>`,
+      `🕐 ${fmtWindow(rid)}`,
+      `📊 Сигналов: ${activeSignals.length}/4`,
+      `🟢 UP: ${upCount} | 🔴 DOWN: ${downCount}`,
+      `📈 BTC: $${Math.round(currentPrice).toLocaleString()}`,
+      ``,
+      `<b>Детали:</b>`,
+      `• ${spx.reason}`,
+      `• ${dxy.reason}`,
+      `• ${tweet.reason}`,
+      `• PM: UP ${(pmUpProb*100).toFixed(0)}% / DOWN ${(pmDownProb*100).toFixed(0)}%`,
+      ``,
+      `⚠️ Нужно ≥2/4 сигналов | Сейчас: ${activeSignals.length}`,
+    ].join('\n');
+
+    console.log(`[BOT] ⏭ SKIP | UP:${upCount} DOWN:${downCount} | ${activeSignals.length}/4 сигналов`);
+    await tgSend(skipMsg);
+
     state.history.unshift({
       id:rid, direction:sig.direction, confidence:sig.confidence,
       reason:sig.reason, betAmount:0, startPrice:currentPrice,
@@ -419,6 +462,31 @@ async function placeBet(rid) {
     await saveState();
     return;
   }
+
+  // Уведомление что сигнал найден и будет ставка
+  const preBetMsg = [
+    `🔍 <b>СИГНАЛ НАЙДЕН</b>`,
+    `🕐 ${fmtWindow(rid)}`,
+    `📊 Сигналов: ${activeSignals.length}/4`,
+    `🟢 UP: ${upCount} | 🔴 DOWN: ${downCount}`,
+    ``,
+    `<b>Решение: ${sig.direction === 'UP' ? '🟢 ВВЕРХ' : '🔴 ВНИЗ'}</b>`,
+    ``,
+    `📈 BTC: $${Math.round(currentPrice).toLocaleString()}`,
+    `💰 Ставка: $${FIXED_BET}`,
+    `🎯 Уверенность: ${sig.confidence}%`,
+    ``,
+    `<b>Детали сигналов:</b>`,
+    `• ${spx.reason}`,
+    `• ${dxy.reason}`,
+    `• ${tweet.reason}`,
+    `• PM: UP ${(pmUpProb*100).toFixed(0)}% / DOWN ${(pmDownProb*100).toFixed(0)}%`,
+  ].join('\n');
+
+  await tgSend(preBetMsg);
+  
+  // Небольшая задержка перед ставкой (чтобы было видно сигнал)
+  await new Promise(resolve => setTimeout(resolve, 1000));
 
   state.wallet.balance = parseFloat((state.wallet.balance - FIXED_BET).toFixed(2));
   state.wallet.totalBet += FIXED_BET;
@@ -432,10 +500,11 @@ async function placeBet(rid) {
   await saveState();
 
   const dirEmoji = sig.direction === 'UP' ? '🟢' : '🔴';
-  console.log(`[BOT] BET: ${sig.direction} | ${sig.reason}`);
-  await tgSend(`${dirEmoji} <b>${sig.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'}</b> · ${fmtWindow(rid)}\nВход: $${Math.round(currentPrice).toLocaleString()} · $${FIXED_BET}\n${sig.reason}\nБаланс: $${state.wallet.balance.toFixed(2)}`);
+  console.log(`[BOT] ✅ BET: ${sig.direction} | ${sig.reason}`);
+  
+  // Финальное подтверждение ставки
+  await tgSend(`${dirEmoji} <b>СТАВКА РАЗМЕЩЕНА</b>\n${sig.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'} · ${fmtWindow(rid)}\nВход: $${Math.round(currentPrice).toLocaleString()}\nБаланс: $${state.wallet.balance.toFixed(2)}`);
 }
-
 async function resolveBet() {
   const bet = state.pendingBet;
   if (!bet || bet.result !== 'pending') return;
