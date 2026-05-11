@@ -199,6 +199,137 @@ async function fetchPriceFallback() {
   }
 }
 
+// ── S&P 500 SHADOW ────────────────────────────────────────────────────
+let spxPrice = 0;
+let spxBuffer = [];
+let spxLastFetch = 0;
+
+async function fetchSPX() {
+  if (Date.now() - spxLastFetch < 15000) return;
+  try {
+    const r = await fetch('https://query1.finance.yahoo.com/v8/finance/chart/^GSPC?range=1d&interval=1m', { timeout:5000 });
+    const d = await r.json();
+    const timestamps = d.chart?.result?.[0]?.timestamp || [];
+    const quotes = d.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+    if (quotes.length > 0) {
+      spxPrice = quotes[quotes.length - 1];
+      spxBuffer = quotes.filter(q => q !== null);
+      spxLastFetch = Date.now();
+      console.log(`[SPX] $${spxPrice?.toFixed(2)} | Points: ${spxBuffer.length}`);
+    }
+  } catch(e) {
+    console.error('[SPX] Fetch error:', e.message);
+  }
+}
+
+function getSPXSignal() {
+  if (spxBuffer.length < 5) return { direction: null, score: 0, reason: 'Нет данных SPX' };
+  const recent3 = spxBuffer.slice(-3);
+  const prev3 = spxBuffer.slice(-6, -3);
+  if (prev3.length < 3) return { direction: null, score: 0, reason: 'SPX мало данных' };
+  const recentAvg = recent3.reduce((a,b) => a+b, 0) / 3;
+  const prevAvg = prev3.reduce((a,b) => a+b, 0) / 3;
+  const change = ((recentAvg - prevAvg) / prevAvg) * 100;
+  let score = 0;
+  let reason = '';
+  if (change > 0.05) { score = 2; reason = `SPX:${change>0?'+':''}${change.toFixed(3)}%▲`; }
+  else if (change < -0.05) { score = -2; reason = `SPX:${change.toFixed(3)}%▼`; }
+  else if (change > 0.02) { score = 1; reason = `SPX:${change>0?'+':''}${change.toFixed(3)}%▲`; }
+  else if (change < -0.02) { score = -1; reason = `SPX:${change.toFixed(3)}%▼`; }
+  else { reason = `SPX:${change>0?'+':''}${change.toFixed(3)}%→нейтр`; }
+  return { direction: score > 0 ? 'UP' : score < 0 ? 'DOWN' : null, score, reason };
+}
+
+// ── DXY INVERSE ───────────────────────────────────────────────────────
+let dxyPrice = 0;
+let dxyBuffer = [];
+let dxyLastFetch = 0;
+
+async function fetchDXY() {
+  if (Date.now() - dxyLastFetch < 15000) return;
+  try {
+    const r = await fetch('https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?range=1d&interval=1m', { timeout:5000 });
+    const d = await r.json();
+    const quotes = d.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+    if (quotes.length > 0) {
+      dxyPrice = quotes[quotes.length - 1];
+      dxyBuffer = quotes.filter(q => q !== null);
+      dxyLastFetch = Date.now();
+      console.log(`[DXY] ${dxyPrice?.toFixed(2)} | Points: ${dxyBuffer.length}`);
+    }
+  } catch(e) {
+    console.error('[DXY] Fetch error:', e.message);
+  }
+}
+
+function getDXYSignal() {
+  if (dxyBuffer.length < 5) return { direction: null, score: 0, reason: 'Нет данных DXY' };
+  const recent3 = dxyBuffer.slice(-3);
+  const prev3 = dxyBuffer.slice(-6, -3);
+  if (prev3.length < 3) return { direction: null, score: 0, reason: 'DXY мало данных' };
+  const recentAvg = recent3.reduce((a,b) => a+b, 0) / 3;
+  const prevAvg = prev3.reduce((a,b) => a+b, 0) / 3;
+  const change = ((recentAvg - prevAvg) / prevAvg) * 100;
+  // DXY inverse: DXY up → BTC down, DXY down → BTC up
+  let score = 0;
+  let reason = '';
+  if (change > 0.05) { score = -2; reason = `DXY:${change>0?'+':''}${change.toFixed(3)}%▼→BTC▲`; }
+  else if (change < -0.05) { score = 2; reason = `DXY:${change.toFixed(3)}%▲→BTC▲`; }
+  else if (change > 0.02) { score = -1; reason = `DXY:${change>0?'+':''}${change.toFixed(3)}%▼→BTC▲`; }
+  else if (change < -0.02) { score = 1; reason = `DXY:${change.toFixed(3)}%▲→BTC▲`; }
+  else { reason = `DXY:${change>0?'+':''}${change.toFixed(3)}%→нейтр`; }
+  return { direction: score > 0 ? 'UP' : score < 0 ? 'DOWN' : null, score, reason };
+}
+
+// ── TWITTER VELOCITY (X API v2) ───────────────────────────────────────
+let tweetSentiment = 0;
+let tweetCount = 0;
+let tweetLastFetch = 0;
+
+async function fetchTweetSentiment() {
+  if (!process.env.TWITTER_BEARER_TOKEN) return;
+  if (Date.now() - tweetLastFetch < 60000) return;
+  try {
+    const keywords = ['bitcoin', 'btc', 'crypto'];
+    const query = keywords.map(k => `(${k} (pump OR dump OR moon OR crash OR long OR short))`).join(' OR ');
+    const r = await fetch(`https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(query)}&max_results=20&tweet.fields=created_at`, {
+      headers: { 'Authorization': `Bearer ${process.env.TWITTER_BEARER_TOKEN}` }
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    const tweets = data.data || [];
+    let bullish = 0, bearish = 0;
+    const bullWords = ['pump', 'moon', 'long', 'buy', 'bullish', 'green'];
+    const bearWords = ['dump', 'crash', 'short', 'sell', 'bearish', 'red'];
+    for (const t of tweets) {
+      const text = t.text.toLowerCase();
+      const bullCount = bullWords.filter(w => text.includes(w)).length;
+      const bearCount = bearWords.filter(w => text.includes(w)).length;
+      if (bullCount > bearCount) bullish++;
+      else if (bearCount > bullCount) bearish++;
+    }
+    tweetCount = bullish + bearish;
+    tweetSentiment = tweetCount > 0 ? (bullish - bearish) / tweetCount : 0;
+    tweetLastFetch = Date.now();
+    console.log(`[TWEET] Bulls:${bullish} Bears:${bearish} Sentiment:${tweetSentiment.toFixed(2)}`);
+  } catch(e) {
+    console.error('[TWEET] Fetch error:', e.message);
+  }
+}
+
+function getTweetSignal() {
+  if (tweetCount < 3) return { direction: null, score: 0, reason: `Твитов:${tweetCount}` };
+  let score = 0;
+  let reason = '';
+  // Contrarian: crowd bullish → we short, crowd bearish → we long
+  if (tweetSentiment > 0.5) { score = -2; reason = `Твиты:${tweetCount}▲→Против`; }
+  else if (tweetSentiment < -0.5) { score = 2; reason = `Твиты:${tweetCount}▼→Против`; }
+  else if (tweetSentiment > 0.2) { score = -1; reason = `Твиты:${tweetCount}▲→СлабоПротив`; }
+  else if (tweetSentiment < -0.2) { score = 1; reason = `Твиты:${tweetCount}▼→СлабоПротив`; }
+  else { reason = `Твиты:${tweetCount}→Нейтр`; }
+  return { direction: score > 0 ? 'UP' : score < 0 ? 'DOWN' : null, score, reason };
+}
+
 // ── POLYMARKET SENTIMENT ──────────────────────────────────────────────
 let pmUpProb = 0.5, pmDownProb = 0.5, pmLastFetch = 0;
 async function fetchPolymarketSentiment() {
@@ -219,115 +350,42 @@ async function fetchPolymarketSentiment() {
   } catch(e) {}
 }
 
-// ── ADVANCED SIGNAL v2.1 (Консенсус + RSI-фильтр + Анти-флет) ────────
-function calcRSI(prices, period = 14) {
-  if (prices.length < period + 1) return 50;
-  const changes = [];
-  for (let i = prices.length - period; i < prices.length; i++) {
-    changes.push(prices[i] - prices[i - 1]);
-  }
-  const gains = changes.filter(c => c > 0).reduce((a,b) => a+b, 0) / period;
-  const losses = changes.filter(c => c < 0).map(c => Math.abs(c)).reduce((a,b) => a+b, 0) / period;
-  if (losses === 0) return 100;
-  return 100 - (100 / (1 + gains/losses));
-}
-
-function calcEMA(prices, period) {
-  if (prices.length < period) return prices[prices.length - 1];
-  const k = 2 / (period + 1);
-  let ema = prices.slice(0, period).reduce((a,b) => a+b, 0) / period;
-  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
-  return ema;
-}
-
+// ── COMBINED SIGNAL (SPX + DXY + TWEETS) ─────────────────────────────
 function aiSignal() {
-  if (priceBuffer.length < 30) {
-    return { direction: 'UP', confidence: 50, reason: 'Жду данные...', score: 0, skip: false };
+  const spx = getSPXSignal();
+  const dxy = getDXYSignal();
+  const tweet = process.env.TWITTER_BEARER_TOKEN ? getTweetSignal() : { direction: null, score: 0, reason: 'Твиттер выкл' };
+  const pm = { direction: null, score: 0, reason: '' };
+
+  // Polymarket как четвёртый сигнал
+  if (pmUpProb > 0.60) { pm.direction = 'UP'; pm.score = 1; pm.reason = `PM:${(pmUpProb*100).toFixed(0)}%▲`; }
+  else if (pmDownProb > 0.60) { pm.direction = 'DOWN'; pm.score = -1; pm.reason = `PM:${(pmDownProb*100).toFixed(0)}%▼`; }
+
+  const signals = [spx, dxy, tweet, pm].filter(s => s.direction !== null);
+  const allSignals = [spx, dxy, tweet, pm];
+
+  // Считаем голоса
+  let upVotes = 0, downVotes = 0, totalScore = 0;
+  const reasons = [];
+  for (const s of allSignals) {
+    reasons.push(s.reason);
+    if (s.direction === 'UP') { upVotes++; totalScore += Math.abs(s.score); }
+    else if (s.direction === 'DOWN') { downVotes++; totalScore -= Math.abs(s.score); }
   }
 
-  let score = 0;
-  const signals = [];
-  const votes = { up: 0, down: 0 };
+  const consensus = Math.max(upVotes, downVotes) / Math.max(1, upVotes + downVotes);
+  const dir = upVotes > downVotes ? 'UP' : 'DOWN';
 
-  // 1. RSI (перекуплен/перепродан)
-  const rsi = calcRSI(priceBuffer);
-  if (rsi < 30) { score += 2; votes.up++; signals.push(`RSI:${rsi.toFixed(0)}▲`); }
-  else if (rsi > 70) { score -= 2; votes.down++; signals.push(`RSI:${rsi.toFixed(0)}▼`); }
-  else if (rsi > 50) { score += 1; votes.up++; signals.push(`RSI:${rsi.toFixed(0)}▲`); }
-  else { score -= 1; votes.down++; signals.push(`RSI:${rsi.toFixed(0)}▼`); }
+  // Нужно минимум 2 из 4 для ставки
+  const skip = signals.length < 2;
 
-  // 2. EMA тренд
-  const ema9 = calcEMA(priceBuffer, 9);
-  const ema21 = calcEMA(priceBuffer, 21);
-  if (ema9 > ema21) { score += 2; votes.up++; signals.push('EMA▲'); }
-  else { score -= 2; votes.down++; signals.push('EMA▼'); }
+  let conf = 45 + (signals.length * 5) + (consensus * 10);
+  conf = Math.min(75, Math.max(40, conf));
 
-  // 3. MACD
-  const ema12 = calcEMA(priceBuffer, 12);
-  const ema26 = calcEMA(priceBuffer, 26);
-  const macd = ema12 - ema26;
-  if (macd > 0) { score += 1.5; votes.up++; signals.push('MACD▲'); }
-  else { score -= 1.5; votes.down++; signals.push('MACD▼'); }
+  const reasonText = `${dir} ${conf.toFixed(0)}% | ${reasons.join(' | ')} | Согласие:${signals.length}/4${skip ? ' ⚠СКИП' : ''}`;
 
-  // 4. Краткосрочный моментум (5 мин)
-  if (priceBuffer.length >= 10) {
-    const now5 = priceBuffer.slice(-5).reduce((a,b)=>a+b,0)/5;
-    const prev5 = priceBuffer.slice(-10, -5).reduce((a,b)=>a+b,0)/5;
-    if (now5 > prev5) { score += 1.5; votes.up++; signals.push('5m▲'); }
-    else { score -= 1.5; votes.down++; signals.push('5m▼'); }
-  }
-
-  // 5. Polymarket
-  if (pmUpProb > 0.60) { score += 2; votes.up++; signals.push(`PM:${(pmUpProb*100).toFixed(0)}%▲`); }
-  else if (pmDownProb > 0.60) { score -= 2; votes.down++; signals.push(`PM:${(pmDownProb*100).toFixed(0)}%▼`); }
-  else if (pmUpProb > 0.52) { score += 1; votes.up++; signals.push(`PM:${(pmUpProb*100).toFixed(0)}%▲`); }
-  else if (pmDownProb > 0.52) { score -= 1; votes.down++; signals.push(`PM:${(pmDownProb*100).toFixed(0)}%▼`); }
-
-  // 6. Волатильность — не влияет на голосование, только на confidence
-  let volatility = 0;
-  let isFlat = false;
-  if (priceBuffer.length >= 30) {
-    const last30 = priceBuffer.slice(-30);
-    const high = Math.max(...last30);
-    const low = Math.min(...last30);
-    volatility = ((high - low) / low) * 100;
-    if (volatility < 0.03) { isFlat = true; signals.push(`Флет:${volatility.toFixed(3)}%`); }
-    else if (volatility > 0.08) { signals.push(`Вола:${volatility.toFixed(2)}%`); }
-  }
-
-  // Консенсус: сколько индикаторов согласны
-  const totalVotes = votes.up + votes.down;
-  const consensusUp = totalVotes > 0 ? votes.up / totalVotes : 0.5;
-  const consensusDown = totalVotes > 0 ? votes.down / totalVotes : 0.5;
-
-  const dir = score > 0 ? 'UP' : 'DOWN';
-  const absScore = Math.abs(score);
-
-  // Базовый confidence
-  let conf = Math.min(75, Math.max(45, 45 + absScore * 2.5));
-
-  // Штраф за слабый консенсус
-  const majority = Math.max(consensusUp, consensusDown);
-  if (majority < 0.6) conf -= 10;
-
-  // Штраф за флет
-  if (isFlat) conf -= 15;
-
-  // Бонус за сильный консенсус
-  if (majority >= 0.8 && !isFlat) conf += 5;
-
-  // Определяем skip ТОЛЬКО если уверенность упала ниже 40%
-  const skip = conf < 40;
-
-  console.log(`[SIGNAL] ${dir} | Score:${score.toFixed(1)} | RSI:${rsi.toFixed(0)} | Vol:${volatility.toFixed(3)}% | Cons:${majority.toFixed(0)}% | Conf:${conf.toFixed(0)}% | Skip:${skip}`);
-
-  return {
-    direction: dir,
-    confidence: parseFloat(conf.toFixed(0)),
-    reason: `${dir} ${conf.toFixed(0)}% | ${signals.join(' | ')}${skip ? ' | ⚠СКИП' : ''}`,
-    score: parseFloat(absScore.toFixed(1)),
-    skip: skip
-  };
+  console.log(`[SIGNAL] ${reasonText}`);
+  return { direction: dir, confidence: conf, reason: reasonText, score: Math.abs(totalScore), skip };
 }
 
 // ── BOT LOGIC ─────────────────────────────────────────────────────────
@@ -340,13 +398,14 @@ async function placeBet(rid) {
     _userBotOn = false; await saveState(); return;
   }
 
-  console.log(`[BOT] ██████ НОВАЯ СТАВКА ${fmtWindow(rid)} ██████`);
+  console.log(`[BOT] ██ НОВАЯ СТАВКА ${fmtWindow(rid)} ██`);
   roundPlaced = rid;
+
   if (!wsConnected) await fetchPriceFallback();
-  await fetchPolymarketSentiment();
+  await Promise.all([fetchSPX(), fetchDXY(), fetchTweetSentiment(), fetchPolymarketSentiment()]);
+
   const sig = aiSignal();
 
-  // ПРОПУСК при низкой уверенности
   if (sig.skip) {
     console.log(`[BOT] ⏭ SKIP ${fmtWindow(rid)} | ${sig.reason}`);
     state.history.unshift({
@@ -373,8 +432,8 @@ async function placeBet(rid) {
   await saveState();
 
   const dirEmoji = sig.direction === 'UP' ? '🟢' : '🔴';
-  console.log(`[BOT] >>> BET: ${sig.direction} | Score: ${sig.score} | ${sig.reason}`);
-  await tgSend(`${dirEmoji} <b>${sig.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'}</b> · ${fmtWindow(rid)}\nВход: $${Math.round(currentPrice).toLocaleString()} · $${FIXED_BET}\nСигнал: ${sig.reason}\nБаланс: $${state.wallet.balance.toFixed(2)}`);
+  console.log(`[BOT] BET: ${sig.direction} | ${sig.reason}`);
+  await tgSend(`${dirEmoji} <b>${sig.direction === 'UP' ? 'ВВЕРХ' : 'ВНИЗ'}</b> · ${fmtWindow(rid)}\nВход: $${Math.round(currentPrice).toLocaleString()} · $${FIXED_BET}\n${sig.reason}\nБаланс: $${state.wallet.balance.toFixed(2)}`);
 }
 
 async function resolveBet() {
@@ -394,13 +453,13 @@ async function resolveBet() {
     state.wallet.wins++; state.stats.curStreak++; state.stats.totalWin += p;
     if (state.stats.curStreak > state.stats.bestStreak) state.stats.bestStreak = state.stats.curStreak;
     bet.result = 'win'; bet.pnl = p;
-    console.log(`[BOT] >>> WIN +$${p.toFixed(2)} | Balance: $${state.wallet.balance.toFixed(2)} | Streak: ${state.stats.curStreak}`);
+    console.log(`[BOT] WIN +$${p.toFixed(2)} | Balance: $${state.wallet.balance.toFixed(2)}`);
     await tgSend(`✅ <b>ВЫИГРЫШ #${state.wallet.wins}</b>\n${bet.direction} · ${bet.window}\nВход: $${Math.round(bet.startPrice).toLocaleString()} → Выход: $${Math.round(bet.endPrice).toLocaleString()}\nПрибыль: +$${p.toFixed(2)} · Баланс: $${state.wallet.balance.toFixed(2)}\nСерия: ${state.stats.curStreak} · W/L: ${state.wallet.wins}/${state.wallet.losses}`);
   } else {
     state.wallet.pnl = parseFloat((state.wallet.pnl - FIXED_BET).toFixed(2));
     state.wallet.losses++; state.stats.curStreak = 0; state.stats.totalLoss += FIXED_BET;
     bet.result = 'loss'; bet.pnl = -FIXED_BET;
-    console.log(`[BOT] >>> LOSS -$${FIXED_BET} | Balance: $${state.wallet.balance.toFixed(2)}`);
+    console.log(`[BOT] LOSS -$${FIXED_BET} | Balance: $${state.wallet.balance.toFixed(2)}`);
     await tgSend(`❌ <b>ПРОИГРЫШ #${state.wallet.losses}</b>\n${bet.direction} · ${bet.window}\nВход: $${Math.round(bet.startPrice).toLocaleString()} → Выход: $${Math.round(bet.endPrice).toLocaleString()}\nПрибыль: -$${FIXED_BET} · Баланс: $${state.wallet.balance.toFixed(2)}\nW/L: ${state.wallet.wins}/${state.wallet.losses}`);
   }
 
@@ -422,23 +481,19 @@ async function tick() {
   const rid = roundId();
   const rem = roundRemain();
 
-  // Лог каждые 30 секунд
   if (Date.now() - lastTickLog > 30000) {
-    console.log(`[TICK] ${fmtWindow(rid)} | Rem: ${Math.floor(rem/1000)}s | BTC: $${Math.round(currentPrice)} | Run: ${shouldBotRun()} | Buffer: ${priceBuffer.length}`);
+    console.log(`[TICK] ${fmtWindow(rid)} | Rem: ${Math.floor(rem/1000)}s | BTC: $${Math.round(currentPrice)} | SPX: $${spxPrice?.toFixed(0) || '?'} | DXY: ${dxyPrice?.toFixed(2) || '?'} | Tweets: ${tweetCount}`);
     lastTickLog = Date.now();
   }
 
-  // Резолв за 10 секунд до конца (и до 1 секунды после)
   if (rem < 10000 && rem > -2000 && state.pendingBet?.result === 'pending') {
     await resolveBet();
   }
 
-  // Ставка в первые 12 секунд нового раунда
   if (rem > ROUND_MS - 12000 && shouldBotRun()) {
     await placeBet(rid);
   }
 
-  // Подстраховка: если пропустили окно ставки, ставим в любую секунду до 30-й
   if (rem > ROUND_MS - 30000 && roundPlaced !== rid && shouldBotRun()) {
     await placeBet(rid);
   }
@@ -446,6 +501,9 @@ async function tick() {
   if (!wsConnected && Date.now() % 30000 < 3000) {
     await fetchPriceFallback();
   }
+
+  // Периодически обновляем SPX и DXY
+  await Promise.all([fetchSPX(), fetchDXY()]);
 }
 
 // ── LISTENERS ─────────────────────────────────────────────────────────
@@ -472,7 +530,7 @@ function setupTelegramListeners() {
   if (!tg) return;
 
   tg.onText(/\/start/, async (msg) => {
-    await tgReply(msg.chat.id, '🤖 <b>BTC 15M v2.1</b>\nСтавка $5 каждые 15 мин\nRSI+EMA+MACD+Консенсус');
+    await tgReply(msg.chat.id, '🤖 <b>BTC 15M v3.0</b>\nSPX Shadow + DXY Inverse + Tweet Velocity\nСтавка $5 · 2/4 сигналов');
   });
 
   tg.onText(/\/balance|💰 Баланс/, async (msg) => {
@@ -497,12 +555,11 @@ function setupTelegramListeners() {
       const sign = diff >= 0 ? '+' : '';
       betInfo = `\n<b>📌 АКТИВНАЯ</b>\n${bet.direction==='UP'?'🟢 ВВЕРХ':'🔴 ВНИЗ'} · ${bet.window}\n$${Math.round(bet.startPrice).toLocaleString()} → $${Math.round(currentPrice).toLocaleString()} (${sign}$${diff})`;
     }
-    await tgReply(msg.chat.id, `📊 <b>СТАТУС</b> · ${timeMSK} МСК\n\n🤖 ${_userBotOn?'✅':'⏸'} | ⏰ ${isWorkingHours()?'✅':'🌙'}\nBTC: $${Math.round(currentPrice).toLocaleString()}\n💰 $${w.balance.toFixed(2)} · P&L: ${w.pnl>=0?'+':''}$${w.pnl.toFixed(2)}\nСтавок: ${total} · WR: ${wr}%\n⏳ До ставки: ${getTimeToNextBet()}${betInfo}`);
+    await tgReply(msg.chat.id, `📊 <b>СТАТУС ${timeMSK}</b>\n\n🤖 ${_userBotOn?'✅':'⏸'} | SPX:$${spxPrice?.toFixed(0)||'?'} | DXY:${dxyPrice?.toFixed(2)||'?'}\n💰 $${w.balance.toFixed(2)} · P&L: ${w.pnl>=0?'+':''}$${w.pnl.toFixed(2)}\nСтавок: ${total} · WR: ${wr}%\n⏳ До ставки: ${getTimeToNextBet()}${betInfo}`);
   });
 
   tg.onText(/\/price|📈 Цена BTC/, async (msg) => {
-    const rsi = priceBuffer.length >= 15 ? calcRSI(priceBuffer).toFixed(0) : '—';
-    await tgReply(msg.chat.id, `📈 <b>BTC</b>\n$${Math.round(currentPrice).toLocaleString()}\nRSI(14): ${rsi}`);
+    await tgReply(msg.chat.id, `<b>Рынки:</b>\nBTC: $${Math.round(currentPrice).toLocaleString()}\nS&P 500: $${spxPrice?.toFixed(0) || '—'}\nDXY: ${dxyPrice?.toFixed(2) || '—'}`);
   });
 
   tg.onText(/\/nextbet|⏳ След. ставка/, async (msg) => {
@@ -527,7 +584,7 @@ function setupTelegramListeners() {
 
 // ── START ─────────────────────────────────────────────────────────────
 async function start() {
-  console.log('🤖 BTC 15M Bot v2.1 — RSI+EMA+MACD+Consensus');
+  console.log('🤖 BTC 15M v3.0 — SPX + DXY + Tweets');
 
   initFirebase();
   initTelegram();
@@ -542,7 +599,8 @@ async function start() {
 
   connectPriceWS();
   await fetchPriceFallback();
-  console.log(`[INIT] BTC: $${Math.round(currentPrice)}`);
+  await Promise.all([fetchSPX(), fetchDXY(), fetchTweetSentiment()]);
+  console.log(`[INIT] BTC:$${Math.round(currentPrice)} SPX:$${spxPrice?.toFixed(0)} DXY:${dxyPrice?.toFixed(2)}`);
 
   if (firebaseReady) listenForCommands();
   setupTelegramListeners();
@@ -555,8 +613,10 @@ async function start() {
     try { await db.ref('btc15m/heartbeat').set({ ts:Date.now(), working:isWorkingHours(), userBotOn:_userBotOn, shouldRun:shouldBotRun() }); } catch(e) {}
   }, 30000);
 
-  await tgSend(`🚀 <b>BTC 15M v2.1</b>\n💰 $${state.wallet.balance.toFixed(2)}\n💵 Ставка: $5 / 15 мин\n📊 RSI+EMA+MACD+Консенсус`);
-  console.log('[INIT] ✅ Bot is live');
+  const sources = ['SPX Shadow', 'DXY Inverse'];
+  if (process.env.TWITTER_BEARER_TOKEN) sources.push('Tweet Velocity');
+  await tgSend(`🚀 <b>BTC 15M v3.0</b>\n💰 $${state.wallet.balance.toFixed(2)}\n💵 $5 · 2/4 сигнала\n📊 ${sources.join(' + ')}`);
+  console.log('[INIT] ✅ Live');
   await tick();
 }
 
